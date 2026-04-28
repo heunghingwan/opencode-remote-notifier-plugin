@@ -1,0 +1,16 @@
+{
+  "server": "https://ntfy.sh",
+  "topic": "changeme",
+  "token": "",
+  "markdown": true,
+  "events": {
+    "error":      { "enabled": true, "priority": 5 },
+    "permission": { "enabled": true, "priority": 4 },
+    "question":   { "enabled": true, "priority": 4 },
+    "idle":       { "enabled": true, "priority": 3 }
+  },
+  "rateLimit": {
+    "maxPerMinute": 5,
+    "dedupWindowSec": 30
+  }
+}
