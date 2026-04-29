@@ -121,7 +121,6 @@ interface NotifyPayload {
 }
 
 async function sendNotification(payload: NotifyPayload): Promise<void> {
-  const url = new URL(`/${payload.topic}`, payload.server)
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   }
@@ -142,7 +141,7 @@ async function sendNotification(payload: NotifyPayload): Promise<void> {
     try {
       const ctrl = new AbortController()
       const timer = setTimeout(() => ctrl.abort(), 10_000)
-      const res = await fetch(url.href, {
+      const res = await fetch(payload.server, {
         method: "POST",
         headers,
         body,
