@@ -44,8 +44,9 @@ const DEFAULTS: Config = {
 
 // ---- Config Reader ----
 
-function readConfig(dir: string): Config | null {
-  const filePath = path.join(dir, ".opencode", "notifier.json")
+function readConfig(): Config | null {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || ""
+  const filePath = path.join(homeDir, ".config", "opencode", "remote-notifier.json")
   try {
     const raw = fs.readFileSync(filePath, "utf-8")
     const user = JSON.parse(raw)
@@ -305,7 +306,7 @@ function handleEvent(
 // ---- Plugin Export ----
 
 export const RemoteNotifier: Plugin = async (input) => {
-  const config = readConfig(input.directory)
+  const config = readConfig()
   if (!config) {
     console.warn("[remote-notifier] config not found or invalid, plugin disabled")
     return {}
