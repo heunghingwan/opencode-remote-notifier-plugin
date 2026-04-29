@@ -214,15 +214,15 @@ function buildMessage(config: Config, type: EventType, payload: any, sessionTitl
       }
     }
     case "permission": {
-      const tool = payload?.tool ?? "unknown"
-      const file = payload?.filePath ?? "unknown"
+      const perm = typeof payload?.permission === "string" ? payload.permission : "unknown"
+      const patterns = Array.isArray(payload?.patterns) ? payload.patterns.join(", ") : payload?.filePath ?? "unknown"
       const project = payload?.project?.name ?? ""
       const prefix = project ? `**${project}**` : ""
       return {
         title,
         message: md
-          ? `${prefix}\n\n\ud83d\udd12 **Permission**\n\n\`${tool}\` on \`${file}\``
-          : `[${project}] Permission: ${tool} on ${file}`,
+          ? `${prefix}\n\n\ud83d\udd12 **Permission**\n\n\`${perm}\` on \`${patterns}\``
+          : `[${project}] Permission: ${perm} on ${patterns}`,
       }
     }
     case "question": {
