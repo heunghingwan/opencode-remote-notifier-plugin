@@ -1,8 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import fs from "node:fs"
 import path from "node:path"
-import https from "node:https"
-import http from "node:http"
 
 // ---- Types ----
 
@@ -93,19 +91,16 @@ class RateLimiter {
   allow(key: string): boolean {
     const now = Date.now()
 
-    // Dedup check
     const lastSent = this.#dedup.get(key)
     if (lastSent !== undefined && now - lastSent < this.#dedupWindow) {
       return false
     }
 
-    // Rate cap check
     this.#timestamps = this.#timestamps.filter((t) => now - t < 60_000)
     if (this.#timestamps.length >= this.#maxPerMinute) {
       return false
     }
 
-    // Passed — record
     this.#dedup.set(key, now)
     this.#timestamps.push(now)
     return true
@@ -125,71 +120,58 @@ interface NotifyPayload {
   tags: string[]
 }
 
-function sendNotification(payload: NotifyPayload, attempt = 1): Promise<void> {
-  return new Promise((resolve) => {
-    const url = new URL(`/${payload.topic}`, payload.server)
-    const headers: Record<string, string> = {
-      "Title": payload.title,
-      "Priority": String(payload.priority),
-      "Tags": payload.tags.join(","),
-      "Content-Type": "text/plain",
-    }
-    if (payload.markdown) {
-      headers["Markdown"] = "yes"
-    }
-    if (payload.token) {
-      headers["Authorization"] = `Bearer ${payload.token}`
-    }
+async function sendNotification(payload: NotifyPayload): Promise<void> {
+  const url = new URL(`/${payload.topic}`, payload.server)
+  const safeTitle = payload.title.replace(/[^\x20-\x7E]/g, "").trim() || "OpenCode"
+  const headers: Record<string, string> = {
+    "Title": safeTitle,
+    "Priority": String(payload.priority),
+    "Tags": payload.tags.map((t) => t.replace(/[^\x20-\x7E]/g, "").trim()).filter(Boolean).join(","),
+    "Content-Type": "text/plain",
+  }
+  if (payload.markdown) {
+    headers["Markdown"] = "yes"
+  }
+  if (payload.token) {
+    headers["Authorization"] = `Bearer ${payload.token}`
+  }
 
-    const transport = url.protocol === "https:" ? https : http
-    const req = transport.request(
-      {
-        hostname: url.hostname,
-        port: url.port || (url.protocol === "https:" ? 443 : 80),
-        path: url.pathname,
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 10_000)
+      const res = await fetch(url.href, {
         method: "POST",
         headers,
-        timeout: 10_000,
-      },
-      (res) => {
-        const status = res.statusCode ?? 0
-        if (status >= 200 && status < 300) {
-          resolve()
-        } else if (attempt < 3) {
-          const delay = Math.pow(2, attempt) * 1000
-          setTimeout(() => sendNotification(payload, attempt + 1).then(resolve), delay)
-        } else {
-          console.warn("[remote-notifier] HTTP send failed after 3 retries, status:", status)
-          resolve()
-        }
-      },
-    )
-
-    req.on("error", (err) => {
+        body: payload.message,
+        signal: ctrl.signal,
+      })
+      clearTimeout(timer)
+      if (res.ok) return
       if (attempt < 3) {
-        const delay = Math.pow(2, attempt) * 1000
-        setTimeout(() => sendNotification(payload, attempt + 1).then(resolve), delay)
+        await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1000))
       } else {
-        console.warn("[remote-notifier] HTTP send failed after 3 retries:", err.message)
-        resolve()
+        console.warn("[remote-notifier] HTTP send failed after 3 retries, status:", res.status)
       }
-    })
-
-    req.on("timeout", () => {
-      req.destroy()
+    } catch (err: any) {
       if (attempt < 3) {
-        const delay = Math.pow(2, attempt) * 1000
-        setTimeout(() => sendNotification(payload, attempt + 1).then(resolve), delay)
+        await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1000))
       } else {
-        console.warn("[remote-notifier] HTTP send timed out after 3 retries")
-        resolve()
+        console.warn("[remote-notifier] HTTP send failed after 3 retries:", err?.message ?? err)
       }
-    })
-
-    req.write(payload.message)
-    req.end()
-  })
+    }
+  }
 }
+
+// ---- Session Title Cache & Pending Notifications ----
+
+const sessionTitles = new Map<string, string>()
+
+interface PendingNotif {
+  timer: ReturnType<typeof setTimeout>
+  send: () => void
+}
+const pendingNotifs = new Map<string, PendingNotif>()
 
 // ---- Event Handler ----
 
@@ -207,8 +189,21 @@ const EVENT_TITLES: Record<EventType, string> = {
   idle:       "OpenCode: Idle",
 }
 
-function buildMessage(config: Config, type: EventType, payload: any): { title: string; message: string } {
-  const title = EVENT_TITLES[type]
+function sanitizeHeaderValue(value: string): string {
+  return value.replace(/[^\x20-\x7E]/g, "").trim()
+}
+
+function isDefaultTitle(title: string): boolean {
+  return /^(New|Child) session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(title)
+}
+
+function buildMessage(config: Config, type: EventType, payload: any, sessionTitle?: string | null): { title: string; message: string } {
+  const baseTitle = EVENT_TITLES[type]
+  // Skip auto-generated default titles (e.g. "New session - 2026-...")
+  const effectiveTitle = sessionTitle && !isDefaultTitle(sessionTitle) ? sessionTitle : null
+  const title = effectiveTitle
+    ? sanitizeHeaderValue(`${baseTitle} - ${effectiveTitle}`)
+    : baseTitle
   const md = config.markdown
 
   switch (type) {
@@ -266,6 +261,27 @@ function handleEvent(
   event: any,
 ) {
   const type = event.type as string
+  const data = event?.properties ?? event?.payload ?? {}
+
+  // Cache session title from session.updated events
+  if (type === "session.updated") {
+    const sessionID = data?.sessionID ?? data?.info?.id
+    const title = data?.info?.title
+    if (sessionID && title) {
+      sessionTitles.set(sessionID, title)
+      // If a real title arrived, flush any pending notification immediately
+      if (!isDefaultTitle(title)) {
+        const pending = pendingNotifs.get(sessionID)
+        if (pending) {
+          clearTimeout(pending.timer)
+          pendingNotifs.delete(sessionID)
+          pending.send()
+        }
+      }
+    }
+    return
+  }
+
   let eventType: EventType | null = null
 
   if (type === "session.error") eventType = "error"
@@ -277,30 +293,48 @@ function handleEvent(
   const eventCfg = config.events[eventType]
   if (!eventCfg.enabled) return
 
-  const dedupKey = `${eventType}:${event.payload?.sessionID ?? "unknown"}`
+  const sessionID = data?.sessionID
+  const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
+
   if (!limiter.allow(dedupKey)) return
 
-  // Resolve project name from payload or fall back to directory basename
-  let project = event.payload?.project?.name ?? path.basename(projectDir)
-  if (!event.payload || typeof event.payload !== "object") {
-    event.payload = {}
-  }
-  if (!event.payload.project) {
-    event.payload.project = { name: project }
+  const doSend = () => {
+    const sessionTitle = sessionID ? sessionTitles.get(sessionID) : null
+    let project = data?.project?.name ?? path.basename(projectDir)
+
+    const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project } }, sessionTitle)
+
+    sendNotification({
+      server: config.server,
+      topic: config.topic,
+      token: config.token,
+      markdown: config.markdown,
+      title,
+      message,
+      priority: eventCfg.priority,
+      tags: EVENT_TAGS[eventType],
+    })
   }
 
-  const { title, message } = buildMessage(config, eventType, event.payload)
+  const cachedTitle = sessionID ? sessionTitles.get(sessionID) : null
 
-  sendNotification({
-    server: config.server,
-    topic: config.topic,
-    token: config.token,
-    markdown: config.markdown,
-    title,
-    message,
-    priority: eventCfg.priority,
-    tags: EVENT_TAGS[eventType],
-  })
+  if (cachedTitle && !isDefaultTitle(cachedTitle)) {
+    // Real title already available — send immediately
+    doSend()
+    return
+  }
+
+  // Default/no title — wait up to 10s for session.updated, then send
+  const timer = setTimeout(() => {
+    if (sessionID) pendingNotifs.delete(sessionID)
+    doSend()
+  }, 10000)
+  if (sessionID) {
+    pendingNotifs.set(sessionID, { timer, send: doSend })
+  } else {
+    // No sessionID at all — just send immediately
+    doSend()
+  }
 }
 
 // ---- Plugin Export ----
