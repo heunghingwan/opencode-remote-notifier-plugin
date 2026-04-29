@@ -122,19 +122,21 @@ interface NotifyPayload {
 
 async function sendNotification(payload: NotifyPayload): Promise<void> {
   const url = new URL(`/${payload.topic}`, payload.server)
-  const safeTitle = payload.title.replace(/[^\x20-\x7E]/g, "").trim() || "OpenCode"
   const headers: Record<string, string> = {
-    "Title": safeTitle,
-    "Priority": String(payload.priority),
-    "Tags": payload.tags.map((t) => t.replace(/[^\x20-\x7E]/g, "").trim()).filter(Boolean).join(","),
-    "Content-Type": "text/plain",
-  }
-  if (payload.markdown) {
-    headers["Markdown"] = "yes"
+    "Content-Type": "application/json",
   }
   if (payload.token) {
     headers["Authorization"] = `Bearer ${payload.token}`
   }
+
+  const body = JSON.stringify({
+    topic: payload.topic,
+    title: payload.title,
+    message: payload.message,
+    priority: payload.priority,
+    tags: payload.tags,
+    ...(payload.markdown ? { markdown: true } : {}),
+  })
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -143,7 +145,7 @@ async function sendNotification(payload: NotifyPayload): Promise<void> {
       const res = await fetch(url.href, {
         method: "POST",
         headers,
-        body: payload.message,
+        body,
         signal: ctrl.signal,
       })
       clearTimeout(timer)
@@ -189,10 +191,6 @@ const EVENT_TITLES: Record<EventType, string> = {
   idle:       "OpenCode: Idle",
 }
 
-function sanitizeHeaderValue(value: string): string {
-  return value.replace(/[^\x20-\x7E]/g, "").trim()
-}
-
 function isDefaultTitle(title: string): boolean {
   return /^(New|Child) session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(title)
 }
@@ -201,9 +199,7 @@ function buildMessage(config: Config, type: EventType, payload: any, sessionTitl
   const baseTitle = EVENT_TITLES[type]
   // Skip auto-generated default titles (e.g. "New session - 2026-...")
   const effectiveTitle = sessionTitle && !isDefaultTitle(sessionTitle) ? sessionTitle : null
-  const title = effectiveTitle
-    ? sanitizeHeaderValue(`${baseTitle} - ${effectiveTitle}`)
-    : baseTitle
+  const title = effectiveTitle ? `${baseTitle} - ${effectiveTitle}` : baseTitle
   const md = config.markdown
 
   switch (type) {
