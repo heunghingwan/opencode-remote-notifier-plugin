@@ -174,6 +174,10 @@ interface PendingNotif {
 }
 const pendingNotifs = new Map<string, PendingNotif>()
 
+// Tracks sub-agent (child) session IDs — idle events from these are suppressed
+// since the main orchestrator continues processing (e.g. during ulw loops).
+const childSessions = new Set<string>()
+
 // ---- Event Handler ----
 
 const EVENT_TAGS: Record<EventType, string[]> = {
@@ -258,6 +262,14 @@ function handleEvent(
   const type = event.type as string
   const data = event?.properties ?? event?.payload ?? {}
 
+  // Track child (sub-agent) sessions so we can suppress their idle events
+  if (type === "session.created" || type === "session.updated") {
+    const info = data?.info
+    if (info?.id && info?.parentID) {
+      childSessions.add(info.id)
+    }
+  }
+
   // Cache session title from session.updated events
   if (type === "session.updated") {
     const sessionID = data?.sessionID ?? data?.info?.id
@@ -277,6 +289,9 @@ function handleEvent(
     return
   }
 
+  // session.created doesn't fire notifications — handled above for parentID tracking
+  if (type === "session.created") return
+
   let eventType: EventType | null = null
 
   if (type === "session.error") eventType = "error"
@@ -289,6 +304,9 @@ function handleEvent(
   if (!eventCfg.enabled) return
 
   const sessionID = data?.sessionID
+
+  // Suppress idle notifications from sub-agent sessions — main orchestrator continues
+  if (eventType === "idle" && sessionID && childSessions.has(sessionID)) return
   const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
 
   if (!limiter.allow(dedupKey)) return
