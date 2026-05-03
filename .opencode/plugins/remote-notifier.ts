@@ -178,6 +178,35 @@ const pendingNotifs = new Map<string, PendingNotif>()
 // since the main orchestrator continues processing (e.g. during ulw loops).
 const childSessions = new Set<string>()
 
+// Maps parent session ID → Set of child session IDs.
+// Used to defer the parent's idle notification until all children complete.
+const childrenByParent = new Map<string, Set<string>>()
+
+// Deferred idle notifications waiting for child sessions to finish.
+// When a parent goes idle with active children, the send is deferred here.
+const deferredIdleByParent = new Map<string, { send: () => void }>()
+
+// Remove a child session from tracking and release the parent's deferred idle
+// if no children remain. Used by both session.idle (child completes) and
+// session.deleted (child removed) events.
+function releaseChild(childID: string): void {
+  childSessions.delete(childID)
+  for (const [parentID, children] of childrenByParent.entries()) {
+    if (children.has(childID)) {
+      children.delete(childID)
+      if (children.size === 0) {
+        childrenByParent.delete(parentID)
+        const deferred = deferredIdleByParent.get(parentID)
+        if (deferred) {
+          deferredIdleByParent.delete(parentID)
+          deferred.send()
+        }
+      }
+      break
+    }
+  }
+}
+
 // ---- Event Handler ----
 
 const EVENT_TAGS: Record<EventType, string[]> = {
@@ -267,6 +296,11 @@ function handleEvent(
     const info = data?.info
     if (info?.id && info?.parentID) {
       childSessions.add(info.id)
+      // Track by parent so we can defer the parent's idle notification
+      if (!childrenByParent.has(info.parentID)) {
+        childrenByParent.set(info.parentID, new Set())
+      }
+      childrenByParent.get(info.parentID)!.add(info.id)
     }
   }
 
@@ -289,6 +323,14 @@ function handleEvent(
     return
   }
 
+  // session.deleted — clean up child tracking; if no more children for a parent,
+  // release any deferred idle notification for that parent
+  if (type === "session.deleted") {
+    const deletedID = data?.sessionID ?? data?.info?.id
+    if (deletedID) releaseChild(deletedID)
+    return
+  }
+
   // session.created doesn't fire notifications — handled above for parentID tracking
   if (type === "session.created") return
 
@@ -306,7 +348,11 @@ function handleEvent(
   const sessionID = data?.sessionID
 
   // Suppress idle notifications from sub-agent sessions — main orchestrator continues
-  if (eventType === "idle" && sessionID && childSessions.has(sessionID)) return
+  // Also treat child idle as completion: may release parent's deferred idle
+  if (eventType === "idle" && sessionID && childSessions.has(sessionID)) {
+    releaseChild(sessionID)
+    return
+  }
   const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
 
   if (!limiter.allow(dedupKey)) return
@@ -327,6 +373,18 @@ function handleEvent(
       priority: eventCfg.priority,
       tags: EVENT_TAGS[eventType],
     })
+  }
+
+  // If the parent (orchestrator) session goes idle while children are still active,
+  // defer the notification until all children complete (either idle or deleted).
+  if (eventType === "idle" && sessionID) {
+    const activeChildren = childrenByParent.get(sessionID)
+    if (activeChildren && activeChildren.size > 0) {
+      if (!deferredIdleByParent.has(sessionID)) {
+        deferredIdleByParent.set(sessionID, { send: doSend })
+      }
+      return
+    }
   }
 
   const cachedTitle = sessionID ? sessionTitles.get(sessionID) : null
