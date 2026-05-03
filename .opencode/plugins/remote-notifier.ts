@@ -186,7 +186,6 @@ const childrenByParent = new Map<string, Set<string>>()
 // if no children remain. Used by both session.idle (child completes) and
 // session.deleted (child removed) events.
 function releaseChild(childID: string): void {
-  childSessions.delete(childID)
   for (const [parentID, children] of childrenByParent.entries()) {
     if (children.has(childID)) {
       children.delete(childID)
@@ -365,7 +364,10 @@ function handleEvent(
   // release any deferred idle notification for that parent
   if (type === "session.deleted") {
     const deletedID = data?.sessionID ?? data?.info?.id
-    if (deletedID) releaseChild(deletedID)
+    if (deletedID) {
+      childSessions.delete(deletedID)
+      releaseChild(deletedID)
+    }
     return
   }
 
