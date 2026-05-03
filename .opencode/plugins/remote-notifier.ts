@@ -182,10 +182,6 @@ const childSessions = new Set<string>()
 // Used to defer the parent's idle notification until all children complete.
 const childrenByParent = new Map<string, Set<string>>()
 
-// Deferred idle notifications waiting for child sessions to finish.
-// When a parent goes idle with active children, the send is deferred here.
-const deferredIdleByParent = new Map<string, { send: () => void }>()
-
 // Remove a child session from tracking and release the parent's deferred idle
 // if no children remain. Used by both session.idle (child completes) and
 // session.deleted (child removed) events.
@@ -204,6 +200,41 @@ function releaseChild(childID: string): void {
       }
       break
     }
+  }
+}
+
+// Deferred idle notifications waiting for child sessions to finish.
+// When a parent goes idle with active children, the send is deferred here.
+const deferredIdleByParent = new Map<string, { send: () => void }>()
+
+// ---- Idle Notification Debounce ----
+// When a session.idle event fires, wait 500ms before sending the notification.
+// If any non-idle event arrives for the same session within that window, another
+// plugin may have continued the session, so the idle notification is cancelled.
+
+interface IdleDebounce {
+  timer: ReturnType<typeof setTimeout>
+  send: () => void
+}
+const idleDebounceSend = new Map<string, IdleDebounce>()
+
+function debounceIdleSend(sessionID: string, send: () => void): void {
+  const existing = idleDebounceSend.get(sessionID)
+  if (existing) clearTimeout(existing.timer)
+
+  const timer = setTimeout(() => {
+    idleDebounceSend.delete(sessionID)
+    send()
+  }, 500)
+
+  idleDebounceSend.set(sessionID, { timer, send })
+}
+
+function cancelIdleDebounce(sessionID: string): void {
+  const existing = idleDebounceSend.get(sessionID)
+  if (existing) {
+    clearTimeout(existing.timer)
+    idleDebounceSend.delete(sessionID)
   }
 }
 
@@ -291,6 +322,13 @@ function handleEvent(
   const type = event.type as string
   const data = event?.properties ?? event?.payload ?? {}
 
+  // Cancel pending idle debounce if any non-idle event arrives — another plugin may
+  // have continued the session, so it's no longer idle.
+  const cancelSessionID = data?.sessionID ?? data?.info?.id
+  if (cancelSessionID && type !== "session.idle") {
+    cancelIdleDebounce(cancelSessionID)
+  }
+
   // Track child (sub-agent) sessions so we can suppress their idle events
   if (type === "session.created" || type === "session.updated") {
     const info = data?.info
@@ -375,22 +413,41 @@ function handleEvent(
     })
   }
 
-  // If the parent (orchestrator) session goes idle while children are still active,
-  // defer the notification until all children complete (either idle or deleted).
+  // ---- Idle debounce: wait 500ms — other plugins may continue the session ----
   if (eventType === "idle" && sessionID) {
+    // Parent with active children: defer until children complete, then debounce
     const activeChildren = childrenByParent.get(sessionID)
     if (activeChildren && activeChildren.size > 0) {
       if (!deferredIdleByParent.has(sessionID)) {
-        deferredIdleByParent.set(sessionID, { send: doSend })
+        deferredIdleByParent.set(sessionID, { send: () => debounceIdleSend(sessionID, doSend) })
       }
       return
     }
+
+    // 500ms debounce: if any event arrives before this fires, the idle notification
+    // is cancelled (another plugin continued the session).
+    debounceIdleSend(sessionID, () => {
+      const cachedTitle = sessionTitles.get(sessionID) ?? null
+
+      if (cachedTitle && !isDefaultTitle(cachedTitle)) {
+        doSend()
+        return
+      }
+
+      // Default/no title — wait up to 10s for session.updated, then send
+      const timer = setTimeout(() => {
+        pendingNotifs.delete(sessionID)
+        doSend()
+      }, 10000)
+      pendingNotifs.set(sessionID, { timer, send: doSend })
+    })
+    return
   }
 
+  // Non-idle events, or idle events without a sessionID — send directly
   const cachedTitle = sessionID ? sessionTitles.get(sessionID) : null
 
   if (cachedTitle && !isDefaultTitle(cachedTitle)) {
-    // Real title already available — send immediately
     doSend()
     return
   }
@@ -403,7 +460,6 @@ function handleEvent(
   if (sessionID) {
     pendingNotifs.set(sessionID, { timer, send: doSend })
   } else {
-    // No sessionID at all — just send immediately
     doSend()
   }
 }
