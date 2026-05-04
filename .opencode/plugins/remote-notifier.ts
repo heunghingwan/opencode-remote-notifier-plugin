@@ -323,9 +323,15 @@ function handleEvent(
 
   // Cancel pending idle debounce if any non-idle event arrives — another plugin may
   // have continued the session, so it's no longer idle.
+  // session.status events REPORT the session's state; they don't change it.
+  // Only cancel when status is "busy" (session resumed). Don't cancel for idle/retry
+  // confirmations — those fire right after session.idle and would incorrectly nuke
+  // the debounce, permanently losing the notification.
   const cancelSessionID = data?.sessionID ?? data?.info?.id
   if (cancelSessionID && type !== "session.idle") {
-    cancelIdleDebounce(cancelSessionID)
+    if (type !== "session.status" || data?.status?.type === "busy") {
+      cancelIdleDebounce(cancelSessionID)
+    }
   }
 
   // Track child (sub-agent) sessions so we can suppress their idle events
