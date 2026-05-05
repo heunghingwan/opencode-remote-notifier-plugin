@@ -115,13 +115,15 @@ class RateLimiter {
     this.#logger = logger
   }
 
-  allow(key: string): boolean {
+  allow(key: string, skipDedup = false): boolean {
     const now = Date.now()
 
-    const lastSent = this.#dedup.get(key)
-    if (lastSent !== undefined && now - lastSent < this.#dedupWindow) {
-      this.#logger.debug("Dedup hit, skipping", { key })
-      return false
+    if (!skipDedup) {
+      const lastSent = this.#dedup.get(key)
+      if (lastSent !== undefined && now - lastSent < this.#dedupWindow) {
+        this.#logger.debug("Dedup hit, skipping", { key })
+        return false
+      }
     }
 
     this.#timestamps = this.#timestamps.filter((t) => now - t < 60_000)
@@ -130,7 +132,9 @@ class RateLimiter {
       return false
     }
 
-    this.#dedup.set(key, now)
+    if (!skipDedup) {
+      this.#dedup.set(key, now)
+    }
     this.#timestamps.push(now)
     return true
   }
@@ -214,31 +218,52 @@ const childSessions = new Set<string>()
 // Used to defer the parent's idle notification until all children complete.
 const childrenByParent = new Map<string, Set<string>>()
 
-// Remove a child session from tracking and release the parent's deferred idle
+// Tracks child sessions that have completed (idle or deleted) to prevent
+// re-tracking via late session.updated events that arrive after releaseChild.
+const releasedChildSessions = new Set<string>()
+
+// Remove a child session from tracking and fire the parent's deferred idle
 // if no children remain. Used by both session.idle (child completes) and
 // session.deleted (child removed) events.
 function releaseChild(childID: string, logger: Logger): void {
+  releasedChildSessions.add(childID)
+  logger.debug("releaseChild called", { childID, trackedParents: [...childrenByParent.keys()] })
   for (const [parentID, children] of childrenByParent.entries()) {
     if (children.has(childID)) {
       children.delete(childID)
-      logger.debug("Child session released", { childID, remaining: children.size })
+      logger.debug("Child session released", { childID, parentID, remaining: children.size })
       if (children.size === 0) {
         childrenByParent.delete(parentID)
         const deferred = deferredIdleByParent.get(parentID)
         if (deferred) {
+          // WARNING: Do NOT add setTimeout here. The deferred idle was stored when
+          // the parent went idle waiting for children. Now that children are done,
+          // the parent is still idle from the user's perspective — fire immediately.
+          // Using setTimeout would risk losing the notification to session.status(busy)
+          // (from parent resuming), and arbitrary delays can't account for variable
+          // sub-agent run times.
           deferredIdleByParent.delete(parentID)
+          logger.debug("Deferred idle firing after children complete", { parentID })
           deferred.send()
-          logger.debug("Parent idle released from defer", { parentID })
+        } else {
+          logger.debug("releaseChild: no deferred idle found for parent", { parentID })
         }
       }
-      break
+      return
+    } else {
+      logger.debug("releaseChild: child not in this parent's set", { childID, parentID, children: [...children] })
     }
   }
+  logger.debug("releaseChild: child not found in any parent", { childID })
 }
 
 // Deferred idle notifications waiting for child sessions to finish.
-// When a parent goes idle with active children, the send is deferred here.
-const deferredIdleByParent = new Map<string, { send: () => void }>()
+// When a parent goes idle with active children, the send is stored here
+// and released when all children complete.
+interface DeferredIdle {
+  send: () => void
+}
+const deferredIdleByParent = new Map<string, DeferredIdle>()
 
 // ---- Idle Notification Debounce ----
 // When a session.idle event fires, wait 500ms before sending the notification.
@@ -361,30 +386,40 @@ function handleEvent(
 
   logger.debug("Event received", { type, sessionID: data?.sessionID ?? data?.info?.id })
 
-  // Cancel pending idle debounce if any non-idle event arrives — another plugin may
-  // have continued the session, so it's no longer idle.
-  // session.status events REPORT the session's state; they don't change it.
-  // Only cancel when status is "busy" (session resumed). Don't cancel for idle/retry
-  // confirmations — those fire right after session.idle and would incorrectly nuke
-  // the debounce, permanently losing the notification.
+  // Cancel pending idle debounce ONLY for events that explicitly indicate the session
+  // has resumed. The idle transition batch-fires informational events (session.updated,
+  // session.diff, message.updated, message.part.updated) within milliseconds of the
+  // idle event, but none of those mean the session is active again — they're just
+  // metadata cleanup. Only session.status(busy), errors, questions, and permissions
+  // are genuine signals that the session is no longer idle.
   const cancelSessionID = data?.sessionID ?? data?.info?.id
-  if (cancelSessionID && type !== "session.idle") {
-    if (type !== "session.status" || data?.status?.type === "busy") {
-      cancelIdleDebounce(cancelSessionID, logger)
-    }
+  const isSessionResumed =
+    (type === "session.status" && data?.status?.type === "busy") ||
+    type === "session.error" ||
+    type === "question.asked" ||
+    type === "permission.asked"
+  if (type === "session.status") {
+    logger.debug("session.status event", { sessionID: cancelSessionID, statusType: data?.status?.type, isIdleDebouncePending: cancelSessionID ? idleDebounceSend.has(cancelSessionID) : null })
+  }
+  if (cancelSessionID && isSessionResumed) {
+    cancelIdleDebounce(cancelSessionID, logger)
   }
 
   // Track child (sub-agent) sessions so we can suppress their idle events
   if (type === "session.created" || type === "session.updated") {
     const info = data?.info
     if (info?.id && info?.parentID) {
-      childSessions.add(info.id)
-      // Track by parent so we can defer the parent's idle notification
-      if (!childrenByParent.has(info.parentID)) {
-        childrenByParent.set(info.parentID, new Set())
+      // Skip if this child was already released (completed idle/deleted) — late
+      // session.updated events arrive after releaseChild and would re-trap the
+      // parent's deferred idle with a child that will never complete again.
+      if (!releasedChildSessions.has(info.id)) {
+        childSessions.add(info.id)
+        if (!childrenByParent.has(info.parentID)) {
+          childrenByParent.set(info.parentID, new Set())
+        }
+        childrenByParent.get(info.parentID)!.add(info.id)
+        logger.debug("Child session tracked", { childID: info.id, parentID: info.parentID })
       }
-      childrenByParent.get(info.parentID)!.add(info.id)
-      logger.debug("Child session tracked", { childID: info.id, parentID: info.parentID })
     }
   }
 
@@ -412,6 +447,7 @@ function handleEvent(
   // release any deferred idle notification for that parent
   if (type === "session.deleted") {
     const deletedID = data?.sessionID ?? data?.info?.id
+    logger.debug("session.deleted received", { deletedID, inChildSessions: deletedID ? childSessions.has(deletedID) : null })
     if (deletedID) {
       childSessions.delete(deletedID)
       releaseChild(deletedID, logger)
@@ -441,13 +477,20 @@ function handleEvent(
 
   // Suppress idle notifications from sub-agent sessions — main orchestrator continues
   // Also treat child idle as completion: may release parent's deferred idle
-  if (eventType === "idle" && sessionID && childSessions.has(sessionID)) {
-    releaseChild(sessionID, logger)
-    return
+  if (eventType === "idle" && sessionID) {
+    if (childSessions.has(sessionID)) {
+      logger.debug("Child session idle — releasing", { sessionID })
+      releaseChild(sessionID, logger)
+      return
+    } else {
+      logger.debug("Session idle — not a tracked child", { sessionID, childSessionsSize: childSessions.size })
+    }
   }
   const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
 
-  if (!limiter.allow(dedupKey)) return
+  // Idle events skip the per-session dedup — sessions naturally go idle multiple
+  // times. The global rate limit (maxPerMinute) still applies.
+  if (!limiter.allow(dedupKey, eventType === "idle")) return
 
   const doSend = () => {
     const sessionTitle = sessionID ? sessionTitles.get(sessionID) : null
@@ -471,11 +514,16 @@ function handleEvent(
 
   // ---- Idle debounce: wait 500ms — other plugins may continue the session ----
   if (eventType === "idle" && sessionID) {
-    // Parent with active children: defer until children complete, then debounce
+    // Parent with active children: defer until children complete. Children may run
+    // tool calls or sub-agents while the parent is idle — the notification fires
+    // when the last child completes (via a non-cancellable delay in releaseChild).
     const activeChildren = childrenByParent.get(sessionID)
     if (activeChildren && activeChildren.size > 0) {
       if (!deferredIdleByParent.has(sessionID)) {
-        deferredIdleByParent.set(sessionID, { send: () => debounceIdleSend(sessionID, doSend, logger) })
+        deferredIdleByParent.set(sessionID, { send: doSend })
+        logger.debug("Parent idle deferred — children active", { sessionID, children: [...activeChildren] })
+      } else {
+        logger.debug("Parent idle already deferred", { sessionID })
       }
       return
     }
