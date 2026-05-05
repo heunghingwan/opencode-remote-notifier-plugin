@@ -20,7 +20,7 @@ function createLogger(client: any): Logger {
     }).catch(() => {})
   }
   return {
-    debug: (msg, extra) => log("debug", msg, extra),
+    debug: (msg, extra) => log("info", msg, extra),
     info: (msg, extra) => log("info", msg, extra),
     warn: (msg, extra) => log("warn", msg, extra),
     error: (msg, extra) => log("error", msg, extra),
