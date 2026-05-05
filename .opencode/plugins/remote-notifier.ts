@@ -2,6 +2,31 @@ import type { Plugin } from "@opencode-ai/plugin"
 import fs from "node:fs"
 import path from "node:path"
 
+// ---- Logger ----
+
+type LoggerLevel = "debug" | "info" | "warn" | "error"
+
+interface Logger {
+  debug(message: string, extra?: Record<string, unknown>): void
+  info(message: string, extra?: Record<string, unknown>): void
+  warn(message: string, extra?: Record<string, unknown>): void
+  error(message: string, extra?: Record<string, unknown>): void
+}
+
+function createLogger(client: any): Logger {
+  const log = (level: LoggerLevel, message: string, extra?: Record<string, unknown>) => {
+    client.app.log({
+      body: { service: "remote-notifier", level, message, extra },
+    }).catch(() => {})
+  }
+  return {
+    debug: (msg, extra) => log("debug", msg, extra),
+    info: (msg, extra) => log("info", msg, extra),
+    warn: (msg, extra) => log("warn", msg, extra),
+    error: (msg, extra) => log("error", msg, extra),
+  }
+}
+
 // ---- Types ----
 
 type EventType = "error" | "permission" | "question" | "idle"
@@ -42,7 +67,7 @@ const DEFAULTS: Config = {
 
 // ---- Config Reader ----
 
-function readConfig(): Config | null {
+function readConfig(logger: Logger): Config | null {
   const homeDir = process.env.HOME || process.env.USERPROFILE || ""
   const filePath = path.join(homeDir, ".config", "opencode", "remote-notifier.json")
   try {
@@ -70,7 +95,7 @@ function readConfig(): Config | null {
     return merged
   } catch (err: any) {
     if (err.code === "ENOENT") return null
-    console.error("[remote-notifier] config error:", err.message)
+    logger.error("Config parse error", { message: err.message })
     return null
   }
 }
@@ -82,10 +107,12 @@ class RateLimiter {
   #timestamps: number[] = []
   #dedupWindow: number
   #maxPerMinute: number
+  #logger: Logger
 
-  constructor(dedupWindowSec: number, maxPerMinute: number) {
+  constructor(dedupWindowSec: number, maxPerMinute: number, logger: Logger) {
     this.#dedupWindow = dedupWindowSec * 1000
     this.#maxPerMinute = maxPerMinute
+    this.#logger = logger
   }
 
   allow(key: string): boolean {
@@ -93,11 +120,13 @@ class RateLimiter {
 
     const lastSent = this.#dedup.get(key)
     if (lastSent !== undefined && now - lastSent < this.#dedupWindow) {
+      this.#logger.debug("Dedup hit, skipping", { key })
       return false
     }
 
     this.#timestamps = this.#timestamps.filter((t) => now - t < 60_000)
     if (this.#timestamps.length >= this.#maxPerMinute) {
+      this.#logger.debug("Rate limit exceeded, skipping", { count: this.#timestamps.length })
       return false
     }
 
@@ -120,7 +149,7 @@ interface NotifyPayload {
   tags: string[]
 }
 
-async function sendNotification(payload: NotifyPayload): Promise<void> {
+async function sendNotification(payload: NotifyPayload, logger: Logger): Promise<void> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   }
@@ -148,17 +177,20 @@ async function sendNotification(payload: NotifyPayload): Promise<void> {
         signal: ctrl.signal,
       })
       clearTimeout(timer)
-      if (res.ok) return
+      if (res.ok) {
+        logger.info("Notification sent successfully", { status: res.status })
+        return
+      }
       if (attempt < 3) {
         await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1000))
       } else {
-        console.warn("[remote-notifier] HTTP send failed after 3 retries, status:", res.status)
+        logger.warn("HTTP send failed after 3 retries", { status: res.status })
       }
     } catch (err: any) {
       if (attempt < 3) {
         await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1000))
       } else {
-        console.warn("[remote-notifier] HTTP send failed after 3 retries:", err?.message ?? err)
+        logger.warn("HTTP send failed after 3 retries", { error: err?.message ?? err })
       }
     }
   }
@@ -185,16 +217,18 @@ const childrenByParent = new Map<string, Set<string>>()
 // Remove a child session from tracking and release the parent's deferred idle
 // if no children remain. Used by both session.idle (child completes) and
 // session.deleted (child removed) events.
-function releaseChild(childID: string): void {
+function releaseChild(childID: string, logger: Logger): void {
   for (const [parentID, children] of childrenByParent.entries()) {
     if (children.has(childID)) {
       children.delete(childID)
+      logger.debug("Child session released", { childID, remaining: children.size })
       if (children.size === 0) {
         childrenByParent.delete(parentID)
         const deferred = deferredIdleByParent.get(parentID)
         if (deferred) {
           deferredIdleByParent.delete(parentID)
           deferred.send()
+          logger.debug("Parent idle released from defer", { parentID })
         }
       }
       break
@@ -217,23 +251,26 @@ interface IdleDebounce {
 }
 const idleDebounceSend = new Map<string, IdleDebounce>()
 
-function debounceIdleSend(sessionID: string, send: () => void): void {
+function debounceIdleSend(sessionID: string, send: () => void, logger: Logger): void {
   const existing = idleDebounceSend.get(sessionID)
   if (existing) clearTimeout(existing.timer)
 
   const timer = setTimeout(() => {
     idleDebounceSend.delete(sessionID)
+    logger.debug("Idle debounce fired", { sessionID })
     send()
   }, 500)
 
   idleDebounceSend.set(sessionID, { timer, send })
+  logger.debug("Idle debounce set", { sessionID })
 }
 
-function cancelIdleDebounce(sessionID: string): void {
+function cancelIdleDebounce(sessionID: string, logger: Logger): void {
   const existing = idleDebounceSend.get(sessionID)
   if (existing) {
     clearTimeout(existing.timer)
     idleDebounceSend.delete(sessionID)
+    logger.debug("Idle debounce cancelled", { sessionID })
   }
 }
 
@@ -317,9 +354,12 @@ function handleEvent(
   limiter: RateLimiter,
   projectDir: string,
   event: any,
+  logger: Logger,
 ) {
   const type = event.type as string
   const data = event?.properties ?? event?.payload ?? {}
+
+  logger.debug("Event received", { type, sessionID: data?.sessionID ?? data?.info?.id })
 
   // Cancel pending idle debounce if any non-idle event arrives — another plugin may
   // have continued the session, so it's no longer idle.
@@ -330,7 +370,7 @@ function handleEvent(
   const cancelSessionID = data?.sessionID ?? data?.info?.id
   if (cancelSessionID && type !== "session.idle") {
     if (type !== "session.status" || data?.status?.type === "busy") {
-      cancelIdleDebounce(cancelSessionID)
+      cancelIdleDebounce(cancelSessionID, logger)
     }
   }
 
@@ -344,6 +384,7 @@ function handleEvent(
         childrenByParent.set(info.parentID, new Set())
       }
       childrenByParent.get(info.parentID)!.add(info.id)
+      logger.debug("Child session tracked", { childID: info.id, parentID: info.parentID })
     }
   }
 
@@ -353,6 +394,7 @@ function handleEvent(
     const title = data?.info?.title
     if (sessionID && title) {
       sessionTitles.set(sessionID, title)
+      logger.debug("Session title cached", { sessionID, title })
       // If a real title arrived, flush any pending notification immediately
       if (!isDefaultTitle(title)) {
         const pending = pendingNotifs.get(sessionID)
@@ -372,7 +414,7 @@ function handleEvent(
     const deletedID = data?.sessionID ?? data?.info?.id
     if (deletedID) {
       childSessions.delete(deletedID)
-      releaseChild(deletedID)
+      releaseChild(deletedID, logger)
     }
     return
   }
@@ -389,14 +431,18 @@ function handleEvent(
   else return
 
   const eventCfg = config.events[eventType]
-  if (!eventCfg.enabled) return
+  if (!eventCfg.enabled) {
+    logger.debug("Event type disabled, skipping", { eventType })
+    return
+  }
 
   const sessionID = data?.sessionID
+  logger.debug("Event mapped to notification", { eventType, sessionID })
 
   // Suppress idle notifications from sub-agent sessions — main orchestrator continues
   // Also treat child idle as completion: may release parent's deferred idle
   if (eventType === "idle" && sessionID && childSessions.has(sessionID)) {
-    releaseChild(sessionID)
+    releaseChild(sessionID, logger)
     return
   }
   const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
@@ -409,6 +455,8 @@ function handleEvent(
 
     const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project } }, sessionTitle)
 
+    logger.info("Sending notification", { type: eventType, title, priority: eventCfg.priority })
+
     sendNotification({
       server: config.server,
       topic: config.topic,
@@ -418,7 +466,7 @@ function handleEvent(
       message,
       priority: eventCfg.priority,
       tags: EVENT_TAGS[eventType],
-    })
+    }, logger)
   }
 
   // ---- Idle debounce: wait 500ms — other plugins may continue the session ----
@@ -427,7 +475,7 @@ function handleEvent(
     const activeChildren = childrenByParent.get(sessionID)
     if (activeChildren && activeChildren.size > 0) {
       if (!deferredIdleByParent.has(sessionID)) {
-        deferredIdleByParent.set(sessionID, { send: () => debounceIdleSend(sessionID, doSend) })
+        deferredIdleByParent.set(sessionID, { send: () => debounceIdleSend(sessionID, doSend, logger) })
       }
       return
     }
@@ -443,12 +491,13 @@ function handleEvent(
       }
 
       // Default/no title — wait up to 10s for session.updated, then send
+      logger.debug("Waiting for session title", { sessionID, waitMs: 10000 })
       const timer = setTimeout(() => {
         pendingNotifs.delete(sessionID)
         doSend()
       }, 10000)
       pendingNotifs.set(sessionID, { timer, send: doSend })
-    })
+    }, logger)
     return
   }
 
@@ -474,21 +523,32 @@ function handleEvent(
 
 // ---- Plugin Export ----
 
-export const RemoteNotifier: Plugin = async (input) => {
-  const config = readConfig()
+export const RemoteNotifier: Plugin = async ({ client, directory }) => {
+  const logger = createLogger(client)
+  const config = readConfig(logger)
   if (!config) {
-    console.warn("[remote-notifier] config not found or invalid, plugin disabled")
+    logger.warn("Config not found/invalid, plugin disabled")
     return {}
   }
+
+  logger.info("Plugin initialized", {
+    server: config.server,
+    topicLength: config.topic.length,
+    markdown: config.markdown,
+    enabledEvents: Object.entries(config.events)
+      .filter(([, v]) => v.enabled)
+      .map(([k]) => k),
+  })
 
   const limiter = new RateLimiter(
     config.rateLimit.dedupWindowSec,
     config.rateLimit.maxPerMinute,
+    logger,
   )
 
   return {
     event: async ({ event }) => {
-      handleEvent(config, limiter, input.directory, event)
+      handleEvent(config, limiter, directory, event, logger)
     },
   }
 }

@@ -2,12 +2,20 @@
   "name": "opencode-remote-notifier-plugin",
   "version": "1.0.0",
   "description": "Push OpenCode events (errors, permission requests, questions, idle) to your phone via ntfy.sh",
-  "keywords": ["opencode", "plugin", "notifier", "ntfy"],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "notifier",
+    "ntfy"
+  ],
   "license": "MIT",
   "author": "Heung Hing Wan",
   "type": "module",
   "main": ".opencode/plugins/remote-notifier.ts",
   "dependencies": {
     "@opencode-ai/plugin": "^1.14.29"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0"
   }
 }
