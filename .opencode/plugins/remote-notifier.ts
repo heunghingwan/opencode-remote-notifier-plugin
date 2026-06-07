@@ -266,7 +266,7 @@ interface DeferredIdle {
 const deferredIdleByParent = new Map<string, DeferredIdle>()
 
 // ---- Idle Notification Debounce ----
-// When a session.idle event fires, wait 500ms before sending the notification.
+// When a session.idle event fires, wait 10s before sending the notification.
 // If any non-idle event arrives for the same session within that window, another
 // plugin may have continued the session, so the idle notification is cancelled.
 
@@ -284,7 +284,7 @@ function debounceIdleSend(sessionID: string, send: () => void, logger: Logger): 
     idleDebounceSend.delete(sessionID)
     logger.debug("Idle debounce fired", { sessionID })
     send()
-  }, 500)
+  }, 10000)
 
   idleDebounceSend.set(sessionID, { timer, send })
   logger.debug("Idle debounce set", { sessionID })
@@ -528,7 +528,7 @@ function handleEvent(
       return
     }
 
-    // 500ms debounce: if any event arrives before this fires, the idle notification
+    // 10s debounce: if any event arrives before this fires, the idle notification
     // is cancelled (another plugin continued the session).
     debounceIdleSend(sessionID, () => {
       const cachedTitle = sessionTitles.get(sessionID) ?? null
