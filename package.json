@@ -13,7 +13,7 @@
   "type": "module",
   "main": ".opencode/plugins/remote-notifier.ts",
   "dependencies": {
-    "@opencode-ai/plugin": "^1.14.29"
+    "@opencode-ai/plugin": "^1.17.0"
   },
   "devDependencies": {
     "@types/node": "^25.6.0"
