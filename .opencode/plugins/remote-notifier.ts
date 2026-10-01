@@ -1,26 +1,31 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import fs from "node:fs"
 import path from "node:path"
 
 // ---- Logger ----
+// V2 plugin context has no structured log endpoint; console output is
+// captured by the server log (filter role=server).
 
 type LoggerLevel = "debug" | "info" | "warn" | "error"
 
-interface Logger {
+export interface Logger {
   debug(message: string, extra?: Record<string, unknown>): void
   info(message: string, extra?: Record<string, unknown>): void
   warn(message: string, extra?: Record<string, unknown>): void
   error(message: string, extra?: Record<string, unknown>): void
 }
 
-function createLogger(client: any): Logger {
+function createLogger(): Logger {
   const log = (level: LoggerLevel, message: string, extra?: Record<string, unknown>) => {
-    client.app.log({
-      body: { service: "remote-notifier", level, message, extra },
-    }).catch(() => {})
+    const suffix = extra && Object.keys(extra).length > 0 ? ` ${JSON.stringify(extra)}` : ""
+    const line = `[remote-notifier] ${message}${suffix}`
+    if (level === "error") console.error(line)
+    else if (level === "warn") console.warn(line)
+    else if (level === "debug") console.debug(line)
+    else console.log(line)
   }
   return {
-    debug: (msg, extra) => log("info", msg, extra),
+    debug: (msg, extra) => log("debug", msg, extra),
     info: (msg, extra) => log("info", msg, extra),
     warn: (msg, extra) => log("warn", msg, extra),
     error: (msg, extra) => log("error", msg, extra),
@@ -29,14 +34,14 @@ function createLogger(client: any): Logger {
 
 // ---- Types ----
 
-type EventType = "error" | "permission" | "question" | "idle"
+export type EventType = "error" | "permission" | "question" | "idle"
 
 interface EventConfig {
   enabled: boolean
   priority: number
 }
 
-interface Config {
+export interface Config {
   server: string
   topic: string
   token: string
@@ -73,7 +78,7 @@ const PERMISSION_DEBOUNCE_MS = 5000
 
 // ---- Config Reader ----
 
-function readConfig(logger: Logger): Config | null {
+export function readConfig(logger: Logger): Config | null {
   const homeDir = process.env.HOME || process.env.USERPROFILE || ""
   const filePath = path.join(homeDir, ".config", "opencode", "remote-notifier.json")
   try {
@@ -108,7 +113,7 @@ function readConfig(logger: Logger): Config | null {
 
 // ---- Rate Limiter ----
 
-class RateLimiter {
+export class RateLimiter {
   #dedup = new Map<string, number>()
   #timestamps: number[] = []
   #dedupWindow: number
@@ -148,7 +153,7 @@ class RateLimiter {
 
 // ---- Notifier Client ----
 
-interface NotifyPayload {
+export interface NotifyPayload {
   server: string
   topic: string
   token: string
@@ -208,60 +213,14 @@ async function sendNotification(payload: NotifyPayload, logger: Logger): Promise
 
 // ---- Session Tracking ----
 // Minimal parent/child + active/errored tracking, mirroring the mature pattern
-// used by opencode's built-in TUI notifications plugin and CodeNomad's UI.
-// The OpenCode core guarantees parent idle fires after foreground children
-// finish, so we do NOT implement our own parent/child join — we simply suppress
-// any session whose parentID is set (sub-agent sessions never notify).
+// used by opencode's built-in TUI notifications plugin. The OpenCode core
+// guarantees parent idle fires after foreground children finish, so we do NOT
+// implement our own parent/child join — we simply suppress any session whose
+// parentID is set (sub-agent sessions never notify).
 
 interface SessionInfo {
   parentID?: string
   title?: string
-}
-
-const sessions = new Map<string, SessionInfo>()
-// Sessions that were busy/retry before going idle. Suppresses no-op idles fired
-// for sessions that were never active (e.g. freshly-created children, or the
-// idle emitted after a cancel with no prior busy).
-const active = new Set<string>()
-// Sessions that errored. Suppresses the trailing idle that follows an error so
-// the user gets one notification, not two.
-const errored = new Set<string>()
-
-interface Debounce {
-  timer: ReturnType<typeof setTimeout>
-  send: () => void
-}
-
-const idleDebounce = new Map<string, Debounce>()
-const permissionDebounce = new Map<string, Debounce>()
-
-function cancelIdleDebounce(sessionID: string): void {
-  const d = idleDebounce.get(sessionID)
-  if (d) {
-    clearTimeout(d.timer)
-    idleDebounce.delete(sessionID)
-  }
-}
-
-function cancelPermissionDebounce(sessionID: string): void {
-  const d = permissionDebounce.get(sessionID)
-  if (d) {
-    clearTimeout(d.timer)
-    permissionDebounce.delete(sessionID)
-  }
-}
-
-function cleanupSession(sessionID: string): void {
-  sessions.delete(sessionID)
-  active.delete(sessionID)
-  errored.delete(sessionID)
-  cancelIdleDebounce(sessionID)
-  cancelPermissionDebounce(sessionID)
-}
-
-function isChildSession(sessionID: string | undefined): boolean {
-  if (!sessionID) return false
-  return Boolean(sessions.get(sessionID)?.parentID)
 }
 
 // ---- Event constants & message builder ----
@@ -284,9 +243,12 @@ function isDefaultTitle(title: string): boolean {
   return /^(New|Child) session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(title)
 }
 
-// Reads both v1 (permission/patterns/filePath) and v2 (action/resources) payload
-// shapes so the plugin works across opencode versions.
-function buildMessage(config: Config, type: EventType, payload: any, sessionTitle?: string | null): { title: string; message: string } {
+// V2 payload shapes (see @opencode/plugin 2.x event schemas):
+//   error      session.execution.failed  data.{sessionID, error.message}
+//   permission permission.asked          data.{sessionID, action, resources}
+//   question   form.created              data.form.{sessionID, title}
+//   idle       session.status            data.{sessionID, status.type}
+export function buildMessage(config: Config, type: EventType, payload: any, sessionTitle?: string | null): { title: string; message: string } {
   const baseTitle = EVENT_TITLES[type]
   const effectiveTitle = sessionTitle && !isDefaultTitle(sessionTitle) ? sessionTitle : null
   const title = effectiveTitle ? `${baseTitle} - ${effectiveTitle}` : baseTitle
@@ -319,7 +281,7 @@ function buildMessage(config: Config, type: EventType, payload: any, sessionTitl
       }
     }
     case "question": {
-      const text = (payload?.questions?.[0]?.question ?? "user input needed").slice(0, 80)
+      const text = (payload?.form?.title ?? "user input needed").slice(0, 80)
       const project = payload?.project?.name ?? ""
       const prefix = project ? `**${project}**` : ""
       return {
@@ -342,231 +304,306 @@ function buildMessage(config: Config, type: EventType, payload: any, sessionTitl
   }
 }
 
-function dispatch(
-  config: Config,
-  limiter: RateLimiter,
-  projectDir: string,
-  eventType: EventType,
-  data: any,
-  sessionID: string | undefined,
-  logger: Logger,
-): void {
-  const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
-  // idle naturally dedups via the active set; other events use per-key dedup.
-  if (!limiter.allow(dedupKey, eventType === "idle")) return
+// ---- Notifier core ----
+// Owns all per-instance state (session map, debounce timers) so the plugin
+// can be unloaded cleanly and multiple locations never share state.
 
-  const sessionTitle = sessionID ? sessions.get(sessionID)?.title ?? null : null
-  const project = data?.project?.name ?? path.basename(projectDir)
-  const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project } }, sessionTitle)
-
-  logger.info("Sending notification", { type: eventType, title, priority: config.events[eventType].priority })
-
-  sendNotification({
-    server: config.server,
-    topic: config.topic,
-    token: config.token,
-    markdown: config.markdown,
-    title,
-    message,
-    priority: config.events[eventType].priority,
-    tags: EVENT_TAGS[eventType],
-  }, logger)
+export interface NotifierDeps {
+  /** Transport used to deliver notifications. Defaults to the ntfy HTTP client. */
+  sender?: (payload: NotifyPayload) => Promise<void> | void
+  idleDebounceMs?: number
+  permissionDebounceMs?: number
 }
 
-// ---- Event Handler ----
+export function createNotifier(config: Config, logger: Logger, projectDir: string, deps: NotifierDeps = {}) {
+  const send = deps.sender ?? ((payload: NotifyPayload) => sendNotification(payload, logger))
+  const idleDebounceMs = deps.idleDebounceMs ?? IDLE_DEBOUNCE_MS
+  const permissionDebounceMs = deps.permissionDebounceMs ?? PERMISSION_DEBOUNCE_MS
+  const limiter = new RateLimiter(config.rateLimit.dedupWindowSec, config.rateLimit.maxPerMinute, logger)
 
-function handleEvent(
-  config: Config,
-  limiter: RateLimiter,
-  projectDir: string,
-  event: any,
-  logger: Logger,
-): void {
-  const type = event.type as string
-  const data = event?.properties ?? event?.payload ?? {}
-  const sessionID: string | undefined = data?.sessionID ?? data?.info?.id
+  const sessions = new Map<string, SessionInfo>()
+  // Sessions that were busy/retry before going idle. Suppresses no-op idles fired
+  // for sessions that were never active (e.g. freshly-created children, or the
+  // idle emitted after a cancel with no prior busy).
+  const active = new Set<string>()
+  // Sessions that errored. Suppresses the trailing idle that follows an error so
+  // the user gets one notification, not two.
+  const errored = new Set<string>()
 
-  logger.debug("Event received", { type, sessionID })
+  const idleDebounce = new Map<string, ReturnType<typeof setTimeout>>()
+  const permissionDebounce = new Map<string, ReturnType<typeof setTimeout>>()
 
-  // ---- Build & update the session map (id, parentID, title) ----
-  // session.created and session.updated both carry the full Session record
-  // under properties.info, including parentID (set for sub-agent sessions).
-  if (type === "session.created" || type === "session.updated") {
-    const info = data?.info
-    if (info?.id) {
-      const prev = sessions.get(info.id)
-      sessions.set(info.id, {
-        parentID: info.parentID ?? prev?.parentID,
-        title: info.title ?? prev?.title,
-      })
-      logger.debug("Session tracked", { id: info.id, parentID: info.parentID ?? null, hasTitle: Boolean(info.title) })
+  function cancelIdleDebounce(sessionID: string): void {
+    const timer = idleDebounce.get(sessionID)
+    if (timer) {
+      clearTimeout(timer)
+      idleDebounce.delete(sessionID)
     }
-    return
   }
 
-  // ---- session.deleted: release all tracking state for this session ----
-  if (type === "session.deleted") {
-    const id = sessionID ?? data?.info?.id
-    if (id) {
-      cleanupSession(id)
-      logger.debug("Session cleaned up", { id })
+  function cancelPermissionDebounce(sessionID: string): void {
+    const timer = permissionDebounce.get(sessionID)
+    if (timer) {
+      clearTimeout(timer)
+      permissionDebounce.delete(sessionID)
     }
-    return
   }
 
-  // ---- session.status: the modern idle/busy signal (session.idle is deprecated) ----
-  // On busy/retry we mark the session active and cancel any pending idle
-  // debounce (the session resumed). On idle we run the mature suppress checks
-  // (no prior busy / trailing idle after error / sub-agent child) then schedule
-  // the idle debounce.
-  if (type === "session.status") {
-    const statusType = data?.status?.type
-    if (statusType === "busy" || statusType === "retry") {
-      if (sessionID) {
-        active.add(sessionID)
-        errored.delete(sessionID)
-        cancelIdleDebounce(sessionID)
+  function isChildSession(sessionID: string | undefined): boolean {
+    if (!sessionID) return false
+    return Boolean(sessions.get(sessionID)?.parentID)
+  }
+
+  function dispatch(
+    eventType: EventType,
+    data: any,
+    sessionID: string | undefined,
+    eventDir: string | null,
+  ): void {
+    const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
+    // idle naturally dedups via the active set; other events use per-key dedup.
+    if (!limiter.allow(dedupKey, eventType === "idle")) return
+
+    const sessionTitle = sessionID ? sessions.get(sessionID)?.title ?? null : null
+    // Events carry the directory of the location they belong to; the plugin's
+    // own directory is only the fallback for events without a location.
+    const project = path.basename(eventDir ?? projectDir)
+    const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project } }, sessionTitle)
+
+    logger.info("Sending notification", { type: eventType, title, priority: config.events[eventType].priority })
+
+    void send({
+      server: config.server,
+      topic: config.topic,
+      token: config.token,
+      markdown: config.markdown,
+      title,
+      message,
+      priority: config.events[eventType].priority,
+      tags: EVENT_TAGS[eventType],
+    })
+  }
+
+  // ---- Event Handler ----
+  // V2 event envelope: { id, created, type, data, location?, metadata? }
+
+  function handleEvent(event: any): void {
+    const type = event?.type as string
+    const data = event?.data ?? {}
+    const sessionID: string | undefined = data?.sessionID ?? data?.form?.sessionID
+    const eventDir: string | null =
+      typeof event?.location?.directory === "string" ? event.location.directory : null
+
+    logger.debug("Event received", { type, sessionID })
+
+    // ---- Track & update the session map (id, parentID, title) ----
+    // session.created carries parentID (set for sub-agent sessions) and the
+    // (initially default) title; session.renamed delivers title updates.
+    if (type === "session.created") {
+      if (data?.sessionID) {
+        const prev = sessions.get(data.sessionID)
+        sessions.set(data.sessionID, {
+          parentID: data.parentID ?? prev?.parentID,
+          title: data.title ?? prev?.title,
+        })
+        logger.debug("Session tracked", { id: data.sessionID, parentID: data.parentID ?? null, hasTitle: Boolean(data.title) })
       }
       return
     }
-    if (statusType !== "idle") return
-    if (!sessionID) return
 
-    // Suppress no-op idle (session was never busy first).
-    if (!active.has(sessionID)) {
-      logger.debug("Idle without prior busy — suppressing", { sessionID })
-      return
-    }
-    active.delete(sessionID)
-
-    // Suppress the trailing idle that follows an error (already notified).
-    if (errored.has(sessionID)) {
-      errored.delete(sessionID)
-      logger.debug("Trailing idle after error — suppressing", { sessionID })
+    if (type === "session.renamed") {
+      if (data?.sessionID && typeof data.title === "string") {
+        const prev = sessions.get(data.sessionID)
+        sessions.set(data.sessionID, {
+          parentID: prev?.parentID,
+          title: data.title,
+        })
+        logger.debug("Session renamed", { id: data.sessionID })
+      }
       return
     }
 
-    // Suppress sub-agent (child) idle — the parent orchestrator drives the flow.
-    if (isChildSession(sessionID)) {
-      logger.debug("Child session idle — suppressing", { sessionID, parentID: sessions.get(sessionID)?.parentID })
+    // ---- session.deleted: release all tracking state for this session ----
+    if (type === "session.deleted") {
+      if (data?.sessionID) {
+        sessions.delete(data.sessionID)
+        active.delete(data.sessionID)
+        errored.delete(data.sessionID)
+        cancelIdleDebounce(data.sessionID)
+        cancelPermissionDebounce(data.sessionID)
+        logger.debug("Session cleaned up", { id: data.sessionID })
+      }
       return
     }
 
-    if (!config.events.idle.enabled) return
+    // ---- session.status: the idle/busy signal ----
+    // On busy/retry we mark the session active and cancel any pending idle
+    // debounce (the session resumed). On idle we run the mature suppress checks
+    // (no prior busy / trailing idle after error / sub-agent child) then schedule
+    // the idle debounce.
+    if (type === "session.status") {
+      const statusType = data?.status?.type
+      if (statusType === "busy" || statusType === "retry") {
+        if (sessionID) {
+          active.add(sessionID)
+          errored.delete(sessionID)
+          cancelIdleDebounce(sessionID)
+        }
+        return
+      }
+      if (statusType !== "idle") return
+      if (!sessionID) return
 
-    // Schedule idle debounce — another plugin (or the user) may resume the
-    // session within the window, in which case session.status busy fires and
-    // cancels this timer.
-    const existing = idleDebounce.get(sessionID)
-    if (existing) clearTimeout(existing.timer)
-    const timer = setTimeout(() => {
-      idleDebounce.delete(sessionID)
-      logger.debug("Idle debounce fired", { sessionID })
-      dispatch(config, limiter, projectDir, "idle", data, sessionID, logger)
-    }, IDLE_DEBOUNCE_MS)
-    idleDebounce.set(sessionID, {
-      timer,
-      send: () => dispatch(config, limiter, projectDir, "idle", data, sessionID, logger),
-    })
-    logger.debug("Idle debounce scheduled", { sessionID, ms: IDLE_DEBOUNCE_MS })
-    return
-  }
+      // Suppress no-op idle (session was never busy first).
+      if (!active.has(sessionID)) {
+        logger.debug("Idle without prior busy — suppressing", { sessionID })
+        return
+      }
+      active.delete(sessionID)
 
-  // ---- Permission: debounce, cancelled by any reply (allow OR block) ----
-  // Listen to BOTH v1 (permission.asked) and v2 (permission.v2.asked) for
-  // cross-version stability. Same for the reply events.
-  if (type === "permission.asked" || type === "permission.v2.asked") {
-    if (!config.events.permission.enabled) return
-    // Sub-agent permissions are suppressed — the parent orchestrator handles them.
-    if (isChildSession(sessionID)) {
-      logger.debug("Child session permission — suppressing", { sessionID })
-      return
-    }
-    // A permission request means the session resumed — cancel any stale idle debounce.
-    if (sessionID) cancelIdleDebounce(sessionID)
+      // Suppress the trailing idle that follows an error (already notified).
+      if (errored.has(sessionID)) {
+        errored.delete(sessionID)
+        logger.debug("Trailing idle after error — suppressing", { sessionID })
+        return
+      }
 
-    const key = sessionID ?? "unknown"
-    const existing = permissionDebounce.get(key)
-    if (existing) clearTimeout(existing.timer)
-    const timer = setTimeout(() => {
-      permissionDebounce.delete(key)
-      logger.debug("Permission debounce fired", { sessionID: key })
-      dispatch(config, limiter, projectDir, "permission", data, sessionID, logger)
-    }, PERMISSION_DEBOUNCE_MS)
-    permissionDebounce.set(key, {
-      timer,
-      send: () => dispatch(config, limiter, projectDir, "permission", data, sessionID, logger),
-    })
-    logger.debug("Permission debounce scheduled", { sessionID: key, ms: PERMISSION_DEBOUNCE_MS })
-    return
-  }
+      // Suppress sub-agent (child) idle — the parent orchestrator drives the flow.
+      if (isChildSession(sessionID)) {
+        logger.debug("Child session idle — suppressing", { sessionID, parentID: sessions.get(sessionID)?.parentID })
+        return
+      }
 
-  // Any reply (allow once / allow always / reject) cancels the pending
-  // permission notification — the user (or an auto-accept) has responded.
-  if (type === "permission.replied" || type === "permission.v2.replied") {
-    if (sessionID) {
-      cancelPermissionDebounce(sessionID)
-      logger.debug("Permission replied — cancelling debounce", { sessionID })
-    }
-    return
-  }
+      if (!config.events.idle.enabled) return
 
-  // ---- Error: send immediately (and suppress the trailing idle) ----
-  if (type === "session.error") {
-    if (!config.events.error.enabled) return
-    if (isChildSession(sessionID)) {
-      logger.debug("Child session error — suppressing", { sessionID })
-      return
-    }
-    if (sessionID) {
-      errored.add(sessionID)
+      // Schedule idle debounce — another plugin (or the user) may resume the
+      // session within the window, in which case session.status busy fires and
+      // cancels this timer.
       cancelIdleDebounce(sessionID)
-    }
-    dispatch(config, limiter, projectDir, "error", data, sessionID, logger)
-    return
-  }
-
-  // ---- Question: send immediately (needs user input) ----
-  if (type === "question.asked" || type === "question.v2.asked") {
-    if (!config.events.question.enabled) return
-    if (isChildSession(sessionID)) {
-      logger.debug("Child session question — suppressing", { sessionID })
+      const timer = setTimeout(() => {
+        idleDebounce.delete(sessionID)
+        logger.debug("Idle debounce fired", { sessionID })
+        dispatch("idle", data, sessionID, eventDir)
+      }, idleDebounceMs)
+      idleDebounce.set(sessionID, timer)
+      logger.debug("Idle debounce scheduled", { sessionID, ms: idleDebounceMs })
       return
     }
-    if (sessionID) cancelIdleDebounce(sessionID)
-    dispatch(config, limiter, projectDir, "question", data, sessionID, logger)
-    return
+
+    // ---- Permission: debounce, cancelled by any reply (allow OR block) ----
+    if (type === "permission.asked") {
+      if (!config.events.permission.enabled) return
+      // Sub-agent permissions are suppressed — the parent orchestrator handles them.
+      if (isChildSession(sessionID)) {
+        logger.debug("Child session permission — suppressing", { sessionID })
+        return
+      }
+      // A permission request means the session resumed — cancel any stale idle debounce.
+      if (sessionID) cancelIdleDebounce(sessionID)
+
+      const key = sessionID ?? "unknown"
+      cancelPermissionDebounce(key)
+      const timer = setTimeout(() => {
+        permissionDebounce.delete(key)
+        logger.debug("Permission debounce fired", { sessionID: key })
+        dispatch("permission", data, sessionID, eventDir)
+      }, permissionDebounceMs)
+      permissionDebounce.set(key, timer)
+      logger.debug("Permission debounce scheduled", { sessionID: key, ms: permissionDebounceMs })
+      return
+    }
+
+    // Any reply (allow once / allow always / reject) cancels the pending
+    // permission notification — the user (or an auto-accept) has responded.
+    if (type === "permission.replied") {
+      if (sessionID) {
+        cancelPermissionDebounce(sessionID)
+        logger.debug("Permission replied — cancelling debounce", { sessionID })
+      }
+      return
+    }
+
+    // ---- Error: send immediately (and suppress the trailing idle) ----
+    if (type === "session.execution.failed") {
+      if (!config.events.error.enabled) return
+      if (isChildSession(sessionID)) {
+        logger.debug("Child session error — suppressing", { sessionID })
+        return
+      }
+      if (sessionID) {
+        errored.add(sessionID)
+        cancelIdleDebounce(sessionID)
+      }
+      dispatch("error", data, sessionID, eventDir)
+      return
+    }
+
+    // ---- Question (form): send immediately (needs user input) ----
+    if (type === "form.created") {
+      if (!config.events.question.enabled) return
+      if (isChildSession(sessionID)) {
+        logger.debug("Child session question — suppressing", { sessionID })
+        return
+      }
+      if (sessionID) cancelIdleDebounce(sessionID)
+      dispatch("question", data, sessionID, eventDir)
+      return
+    }
   }
+
+  function cleanup(): void {
+    for (const timer of idleDebounce.values()) clearTimeout(timer)
+    for (const timer of permissionDebounce.values()) clearTimeout(timer)
+    idleDebounce.clear()
+    permissionDebounce.clear()
+    sessions.clear()
+    active.clear()
+    errored.clear()
+  }
+
+  return { handleEvent, cleanup }
 }
 
 // ---- Plugin Export ----
 
-export const RemoteNotifier: Plugin = async ({ client, directory }) => {
-  const logger = createLogger(client)
-  const config = readConfig(logger)
-  if (!config) {
-    logger.warn("Config not found/invalid, plugin disabled")
-    return {}
-  }
+export default Plugin.define({
+  id: "remote-notifier",
+  setup(ctx) {
+    const logger = createLogger()
+    const config = readConfig(logger)
+    if (!config) {
+      logger.warn("Config not found/invalid, plugin disabled")
+      return
+    }
 
-  logger.info("Plugin initialized", {
-    server: config.server,
-    topicLength: config.topic.length,
-    markdown: config.markdown,
-    enabledEvents: Object.entries(config.events)
-      .filter(([, v]) => v.enabled)
-      .map(([k]) => k),
-  })
+    logger.info("Plugin initialized", {
+      server: config.server,
+      topicLength: config.topic.length,
+      markdown: config.markdown,
+      enabledEvents: Object.entries(config.events)
+        .filter(([, v]) => v.enabled)
+        .map(([k]) => k),
+    })
 
-  const limiter = new RateLimiter(
-    config.rateLimit.dedupWindowSec,
-    config.rateLimit.maxPerMinute,
-    logger,
-  )
+    const notifier = createNotifier(config, logger, ctx.location.directory)
+    const controller = new AbortController()
 
-  return {
-    event: async ({ event }) => {
-      handleEvent(config, limiter, directory, event, logger)
-    },
-  }
-}
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          notifier.handleEvent(event)
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          logger.error("Event subscription failed", { error: String(err) })
+        }
+      }
+    })()
+
+    return () => {
+      controller.abort()
+      notifier.cleanup()
+      logger.info("Plugin unloaded")
+    }
+  },
+})
