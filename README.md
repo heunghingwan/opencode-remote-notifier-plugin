@@ -2,6 +2,8 @@
 
 Push OpenCode events (errors, permission requests, questions, idle) to your phone via [ntfy.sh](https://ntfy.sh).
 
+Built for **OpenCode V2** (v2.0.21+). The V1 plugin API is not supported.
+
 ## Features
 
 - **4 event types**: session errors, permission requests, questions, idle notifications
@@ -12,11 +14,11 @@ Push OpenCode events (errors, permission requests, questions, idle) to your phon
 
 ## Install
 
-Add to the `plugin` array in your `opencode.json`:
+Add to the `plugins` array in your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-remote-notifier-plugin@git+https://github.com/heunghingwan/opencode-remote-notifier-plugin.git"]
+  "plugins": ["opencode-remote-notifier-plugin@git+https://github.com/heunghingwan/opencode-remote-notifier-plugin.git"]
 }
 ```
 
@@ -45,6 +47,12 @@ Then create `~/.config/opencode/remote-notifier.json`:
 
 Install the [ntfy.sh app](https://ntfy.sh/docs/subscribe/phone/) on your phone and subscribe to the topic.
 
+Verify the plugin is loaded:
+
+```sh
+opencode plugin list
+```
+
 ## Configuration
 
 | Field | Default | Description |
@@ -58,7 +66,7 @@ Install the [ntfy.sh app](https://ntfy.sh/docs/subscribe/phone/) on your phone a
 
 | Event | Trigger | Default Priority |
 |---|---|---|
-| `error` | Session errors (LLM failures, API errors) | 5 (urgent) |
+| `error` | Session execution failures (LLM failures, API errors) | 5 (urgent) |
 | `permission` | Agent requests permission to access files | 4 (high) |
 | `question` | Agent asks the user a question | 4 (high) |
 | `idle` | Session becomes idle/waiting for input | 3 (default) |
@@ -70,11 +78,21 @@ Install the [ntfy.sh app](https://ntfy.sh/docs/subscribe/phone/) on your phone a
 
 ## How It Works
 
-The plugin subscribes to OpenCode's internal event bus and forwards relevant events as ntfy.sh push notifications:
+The plugin subscribes to OpenCode's V2 server event stream (`ctx.event.subscribe`) and forwards relevant events as ntfy.sh push notifications:
 
-1. `session.updated` events are intercepted to cache the conversation title
-2. When a notification event fires (`error`, `permission`, `question`, `idle`), the cached title is included
-3. If the title is still the auto-generated default (`New session - ...`), the plugin waits up to 10 seconds for the LLM to generate a real title before sending
+1. `session.created` events are intercepted to cache the session's title and parent (sub-agent sessions are silenced)
+2. `session.renamed` events update the cached title; when a notification fires, the real title is included
+3. If the title is still the auto-generated default (`New session - ...`), only the generic event title is sent
+
+Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle).
+
+## Development
+
+```sh
+bun install        # root + .opencode/
+bun test           # unit tests (.opencode/test/)
+bun run typecheck  # tsc --noEmit
+```
 
 ## License
 
