@@ -225,7 +225,87 @@ describe("question notifications", () => {
 
 // ---- Idle notifications ----
 
-describe("idle notifications", () => {
+describe("idle notifications (V2 execution lifecycle)", () => {
+  // In OpenCode 2.0.21 session.status/session.idle have no emitters; the real
+  // busy/idle signal is session.execution.started / session.execution.succeeded.
+  test("execution.started then succeeded sends an idle notification after debounce", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    expect(calls.length).toBe(0)
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("OpenCode: Idle")
+    expect(calls[0]!.priority).toBe(3)
+  })
+
+  test("succeeded without a prior started is suppressed", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("execution.failed sends the error notification but no idle notification", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(executionFailed())
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("OpenCode: Error")
+  })
+
+  test("a new execution.started cancels a pending idle debounce", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("execution.interrupted (user-initiated) does not notify idle", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(ev("session.execution.interrupted", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("child session idle via execution.succeeded is suppressed", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated({ parentID: "ses_parent" }))
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("idle notification includes the renamed session title", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.renamed", { sessionID: SESSION_ID, title: "Fix login bug" }))
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("OpenCode: Idle - Fix login bug")
+  })
+})
+
+describe("idle notifications (session.status, future OpenCode versions)", () => {
   test("sends an idle notification after the debounce window", async () => {
     const calls: SentCall[] = []
     const n = makeNotifier((p) => calls.push(p))

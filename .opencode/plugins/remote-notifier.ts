@@ -384,6 +384,53 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     })
   }
 
+  // Shared idle-signal handling. Called from both session.status idle and
+  // session.execution.succeeded (the real signal on OpenCode ≤2.0.21, where
+  // session.status has no emitter). Runs the mature suppress checks (no prior
+  // busy / trailing idle after error / sub-agent child) then schedules the
+  // idle debounce.
+  function handleIdleSignal(sessionID: string, data: any, eventDir: string | null): void {
+    // Suppress no-op idle (session was never busy first).
+    if (!active.has(sessionID)) {
+      logger.debug("Idle without prior busy — suppressing", { sessionID })
+      return
+    }
+    active.delete(sessionID)
+
+    // Suppress the trailing idle that follows an error (already notified).
+    if (errored.has(sessionID)) {
+      errored.delete(sessionID)
+      logger.debug("Trailing idle after error — suppressing", { sessionID })
+      return
+    }
+
+    // Suppress sub-agent (child) idle — the parent orchestrator drives the flow.
+    if (isChildSession(sessionID)) {
+      logger.debug("Child session idle — suppressing", { sessionID, parentID: sessions.get(sessionID)?.parentID })
+      return
+    }
+
+    if (!config.events.idle.enabled) return
+
+    // Schedule idle debounce — another plugin (or the user) may resume the
+    // session within the window, in which case a busy signal fires and
+    // cancels this timer.
+    cancelIdleDebounce(sessionID)
+    const timer = setTimeout(() => {
+      idleDebounce.delete(sessionID)
+      logger.debug("Idle debounce fired", { sessionID })
+      dispatch("idle", data, sessionID, eventDir)
+    }, idleDebounceMs)
+    idleDebounce.set(sessionID, timer)
+    logger.debug("Idle debounce scheduled", { sessionID, ms: idleDebounceMs })
+  }
+
+  function markBusy(sessionID: string): void {
+    active.add(sessionID)
+    errored.delete(sessionID)
+    cancelIdleDebounce(sessionID)
+  }
+
   // ---- Event Handler ----
   // V2 event envelope: { id, created, type, data, location?, metadata? }
 
@@ -436,57 +483,42 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       return
     }
 
-    // ---- session.status: the idle/busy signal ----
-    // On busy/retry we mark the session active and cancel any pending idle
-    // debounce (the session resumed). On idle we run the mature suppress checks
-    // (no prior busy / trailing idle after error / sub-agent child) then schedule
-    // the idle debounce.
+    // ---- Execution lifecycle: the real busy/idle signal on OpenCode ≤2.0.21 ----
+    // session.status/session.idle exist in the schema but have no emitter in
+    // 2.0.21 (marked deprecated); emitters were only added after 2.0.21. Drive
+    // idle notifications from the execution lifecycle instead:
+    //   started    → busy
+    //   succeeded  → idle signal (debounced notification)
+    //   failed     → error notification (handled below), no idle notification
+    //   interrupted → user-initiated stop (user is present) — no notification
+    if (type === "session.execution.started") {
+      if (sessionID) markBusy(sessionID)
+      return
+    }
+
+    if (type === "session.execution.succeeded") {
+      if (sessionID) handleIdleSignal(sessionID, data, eventDir)
+      return
+    }
+
+    if (type === "session.execution.interrupted") {
+      if (sessionID) {
+        active.delete(sessionID)
+        cancelIdleDebounce(sessionID)
+      }
+      return
+    }
+
+    // ---- session.status: busy/idle signal on newer OpenCode versions ----
+    // (no emitter in 2.0.21; kept for forward compatibility)
     if (type === "session.status") {
       const statusType = data?.status?.type
       if (statusType === "busy" || statusType === "retry") {
-        if (sessionID) {
-          active.add(sessionID)
-          errored.delete(sessionID)
-          cancelIdleDebounce(sessionID)
-        }
+        if (sessionID) markBusy(sessionID)
         return
       }
       if (statusType !== "idle") return
-      if (!sessionID) return
-
-      // Suppress no-op idle (session was never busy first).
-      if (!active.has(sessionID)) {
-        logger.debug("Idle without prior busy — suppressing", { sessionID })
-        return
-      }
-      active.delete(sessionID)
-
-      // Suppress the trailing idle that follows an error (already notified).
-      if (errored.has(sessionID)) {
-        errored.delete(sessionID)
-        logger.debug("Trailing idle after error — suppressing", { sessionID })
-        return
-      }
-
-      // Suppress sub-agent (child) idle — the parent orchestrator drives the flow.
-      if (isChildSession(sessionID)) {
-        logger.debug("Child session idle — suppressing", { sessionID, parentID: sessions.get(sessionID)?.parentID })
-        return
-      }
-
-      if (!config.events.idle.enabled) return
-
-      // Schedule idle debounce — another plugin (or the user) may resume the
-      // session within the window, in which case session.status busy fires and
-      // cancels this timer.
-      cancelIdleDebounce(sessionID)
-      const timer = setTimeout(() => {
-        idleDebounce.delete(sessionID)
-        logger.debug("Idle debounce fired", { sessionID })
-        dispatch("idle", data, sessionID, eventDir)
-      }, idleDebounceMs)
-      idleDebounce.set(sessionID, timer)
-      logger.debug("Idle debounce scheduled", { sessionID, ms: idleDebounceMs })
+      if (sessionID) handleIdleSignal(sessionID, data, eventDir)
       return
     }
 
