@@ -7,7 +7,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import pluginDefault, { buildMessage, createNotifier, RateLimiter, readConfig } from "../plugins/remote-notifier.ts"
-import type { Config } from "../plugins/remote-notifier.ts"
+import type { Config, NotifierDeps } from "../plugins/remote-notifier.ts"
 
 // ---- Fixtures ----
 
@@ -51,7 +51,8 @@ function sessionCreated(extra: Record<string, unknown> = {}, sessionID = SESSION
   return ev("session.created", {
     sessionID,
     projectID: "prj_1",
-    location: "/home/wan/work/alpha",
+    // Real 2.x payload shape (observed live): location is an object.
+    location: { directory: "/home/wan/work/alpha" },
     subpath: "",
     slug: "new-session",
     title: "New session - 2026-10-01T10:00:00",
@@ -108,11 +109,12 @@ interface SentCall {
   tags: string[]
 }
 
-function makeNotifier(sender: (p: any) => void, directory = PLUGIN_DIR) {
+function makeNotifier(sender: (p: any) => void, directory = PLUGIN_DIR, deps: Partial<NotifierDeps> = {}) {
   return createNotifier(config, silentLogger, directory, {
     sender,
     idleDebounceMs: 15,
     permissionDebounceMs: 15,
+    ...deps,
   })
 }
 
@@ -349,10 +351,10 @@ describe("idle notifications (session.status, future OpenCode versions)", () => 
     expect(calls.length).toBe(0)
   })
 
-  test("uses the event location directory as the project name", async () => {
+  test("uses the session's directory as the project name", async () => {
     const calls: SentCall[] = []
-    const n = makeNotifier((p) => calls.push(p))
-    n.handleEvent(sessionCreated())
+    const n = makeNotifier((p) => calls.push(p), "/home/wan/work/beta")
+    n.handleEvent(sessionCreated({ location: { directory: "/home/wan/work/beta" } }))
     n.handleEvent(ev("session.status", { sessionID: SESSION_ID, status: { type: "busy" } }, "/home/wan/work/beta"))
     n.handleEvent(ev("session.status", { sessionID: SESSION_ID, status: { type: "idle" } }, "/home/wan/work/beta"))
     await sleep(50)
@@ -363,8 +365,8 @@ describe("idle notifications (session.status, future OpenCode versions)", () => 
   test("falls back to the plugin directory when the event has no location", async () => {
     const calls: SentCall[] = []
     const n = makeNotifier((p) => calls.push(p), "/home/wan/work/gamma")
-    n.handleEvent(sessionCreated())
-    n.handleEvent(busy())
+    n.handleEvent(sessionCreated({ location: { directory: "/home/wan/work/gamma" } }))
+    n.handleEvent(ev("session.status", { sessionID: SESSION_ID, status: { type: "busy" } }, null))
     n.handleEvent(ev("session.status", { sessionID: SESSION_ID, status: { type: "idle" } }, null))
     await sleep(50)
     expect(calls.length).toBe(1)
@@ -380,6 +382,143 @@ describe("idle notifications (session.status, future OpenCode versions)", () => 
     n.cleanup()
     await sleep(50)
     expect(calls.length).toBe(0)
+  })
+})
+
+// ---- Multi-location ownership ----
+// OpenCode V2 instantiates the plugin once per active location (project
+// directory) in one shared server, and every instance receives ALL events
+// from the global bus. session.execution.* events carry no envelope location,
+// so without an ownership filter each instance treats every session as its
+// own and N locations produce N duplicate notifications.
+
+describe("multi-location ownership (one plugin instance per location)", () => {
+  test("only the instance whose directory owns the session sends the idle notification", async () => {
+    const alpha: SentCall[] = []
+    const beta: SentCall[] = []
+    const a = makeNotifier((p) => alpha.push(p), "/home/wan/work/alpha")
+    const b = makeNotifier((p) => beta.push(p), "/home/wan/work/beta")
+    const events = [
+      sessionCreated({ location: { directory: "/home/wan/work/alpha" } }),
+      ev("session.execution.started", { sessionID: SESSION_ID }, null),
+      ev("session.execution.succeeded", { sessionID: SESSION_ID }, null),
+    ]
+    for (const event of events) {
+      a.handleEvent(event)
+      b.handleEvent(event)
+    }
+    await sleep(50)
+    expect(alpha.length).toBe(1)
+    expect(beta.length).toBe(0)
+  })
+
+  test("foreign permission requests are skipped — the owning instance notifies", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), "/home/wan/work/beta")
+    n.handleEvent(sessionCreated())
+    n.handleEvent(permissionAsked())
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("event envelope location seeds ownership when session.created was missed", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), "/home/wan/work/beta")
+    // No session.created seen; the envelope says the session lives in alpha.
+    n.handleEvent(permissionAsked())
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("an unseen session's directory is resolved before deciding ownership", async () => {
+    const calls: SentCall[] = []
+    let resolved = 0
+    const n = makeNotifier((p) => calls.push(p), "/home/wan/work/alpha", {
+      resolveSessionDir: async () => {
+        resolved++
+        return "/home/wan/work/alpha"
+      },
+    })
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, null))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, null))
+    expect(calls.length).toBe(0)
+    await sleep(60)
+    expect(resolved).toBe(1)
+    expect(calls.length).toBe(1)
+  })
+
+  test("a resolved foreign session sends nothing", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), "/home/wan/work/alpha", {
+      resolveSessionDir: async () => "/home/wan/work/beta",
+    })
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, null))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, null))
+    await sleep(60)
+    expect(calls.length).toBe(0)
+  })
+
+  test("without a resolver, unknown sessions keep legacy single-instance behavior", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), "/home/wan/work/gamma")
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, null))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, null))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.message).toContain("**gamma**")
+  })
+})
+
+// ---- Plugin setup wiring ----
+
+describe("plugin setup wiring", () => {
+  test("setup subscribes to events and resolves session directories via ctx.session.get", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "notifier-home-"))
+    fs.mkdirSync(path.join(home, ".config", "opencode"), { recursive: true })
+    fs.writeFileSync(
+      path.join(home, ".config", "opencode", "remote-notifier.json"),
+      // The idle debounce (default 5s) is cancelled by dispose() before it
+      // fires, so the server is never actually reached; it only satisfies
+      // config validation. This test asserts the wiring, not delivery.
+      JSON.stringify({ server: "http://127.0.0.1:9", topic: "wiring" }),
+    )
+    const prevHome = process.env.HOME
+    process.env.HOME = home
+
+    let sessionGets = 0
+    const ctx: any = {
+      location: { directory: "/home/wan/work/alpha" },
+      session: {
+        get: async ({ sessionID }: { sessionID: string }) => {
+          sessionGets++
+          return { id: sessionID, location: { directory: "/home/wan/work/alpha" } }
+        },
+      },
+      event: {
+        subscribe: async function* ({ signal }: { signal: AbortSignal }) {
+          const events = [
+            ev("session.execution.started", { sessionID: SESSION_ID }, null),
+            ev("session.execution.succeeded", { sessionID: SESSION_ID }, null),
+          ]
+          for (const event of events) {
+            if (signal.aborted) return
+            yield event
+          }
+          // Hold the stream open until the test is done observing.
+          await new Promise(() => {})
+        },
+      },
+    }
+
+    try {
+      const dispose = (pluginDefault as any).setup(ctx)
+      await sleep(80)
+      expect(sessionGets).toBe(1)
+      dispose()
+    } finally {
+      process.env.HOME = prevHome
+      fs.rmSync(home, { recursive: true, force: true })
+    }
   })
 })
 

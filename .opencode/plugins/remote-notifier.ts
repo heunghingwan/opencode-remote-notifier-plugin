@@ -221,6 +221,15 @@ async function sendNotification(payload: NotifyPayload, logger: Logger): Promise
 interface SessionInfo {
   parentID?: string
   title?: string
+  /**
+   * Directory of the location this session belongs to (from session.created's
+   * data.location, an event envelope location, or the session API). Used to
+   * decide ownership: OpenCode V2 instantiates this plugin once per active
+   * location, all instances receive every event, and only the instance whose
+   * directory matches the session's may notify.
+   * undefined = never learned yet; null = looked up but unknown.
+   */
+  directory?: string | null
 }
 
 // ---- Event constants & message builder ----
@@ -313,12 +322,20 @@ export interface NotifierDeps {
   sender?: (payload: NotifyPayload) => Promise<void> | void
   idleDebounceMs?: number
   permissionDebounceMs?: number
+  /**
+   * Resolves a session's location directory when it wasn't learned from
+   * events (e.g. this instance booted after session.created was published).
+   * Production wiring uses ctx.session.get. Without it, sessions of unknown
+   * directory are treated as local (legacy single-instance behavior).
+   */
+  resolveSessionDir?: (sessionID: string) => Promise<string | null>
 }
 
 export function createNotifier(config: Config, logger: Logger, projectDir: string, deps: NotifierDeps = {}) {
   const send = deps.sender ?? ((payload: NotifyPayload) => sendNotification(payload, logger))
   const idleDebounceMs = deps.idleDebounceMs ?? IDLE_DEBOUNCE_MS
   const permissionDebounceMs = deps.permissionDebounceMs ?? PERMISSION_DEBOUNCE_MS
+  const resolveSessionDir = deps.resolveSessionDir
   const limiter = new RateLimiter(config.rateLimit.dedupWindowSec, config.rateLimit.maxPerMinute, logger)
 
   const sessions = new Map<string, SessionInfo>()
@@ -332,6 +349,9 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
 
   const idleDebounce = new Map<string, ReturnType<typeof setTimeout>>()
   const permissionDebounce = new Map<string, ReturnType<typeof setTimeout>>()
+  // Serializes async ownership resolution per session so events keep their
+  // order (started must be processed before succeeded).
+  const pending = new Map<string, Promise<void>>()
 
   function cancelIdleDebounce(sessionID: string): void {
     const timer = idleDebounce.get(sessionID)
@@ -365,9 +385,11 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     if (!limiter.allow(dedupKey, eventType === "idle")) return
 
     const sessionTitle = sessionID ? sessions.get(sessionID)?.title ?? null : null
-    // Events carry the directory of the location they belong to; the plugin's
-    // own directory is only the fallback for events without a location.
-    const project = path.basename(eventDir ?? projectDir)
+    // Prefer the session's own directory (learned from session.created or the
+    // session API), then the event envelope location; the plugin instance's
+    // directory is only the fallback for events without a location.
+    const sessionDir = sessionID ? sessions.get(sessionID)?.directory ?? null : null
+    const project = path.basename(sessionDir ?? eventDir ?? projectDir)
     const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project } }, sessionTitle)
 
     logger.info("Sending notification", { type: eventType, title, priority: config.events[eventType].priority })
@@ -449,11 +471,15 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     if (type === "session.created") {
       if (data?.sessionID) {
         const prev = sessions.get(data.sessionID)
+        const loc = data?.location
+        const createdDir =
+          typeof loc === "string" ? loc : typeof loc?.directory === "string" ? loc.directory : undefined
         sessions.set(data.sessionID, {
           parentID: data.parentID ?? prev?.parentID,
           title: data.title ?? prev?.title,
+          directory: createdDir ?? prev?.directory,
         })
-        logger.debug("Session tracked", { id: data.sessionID, parentID: data.parentID ?? null, hasTitle: Boolean(data.title) })
+        logger.debug("Session tracked", { id: data.sessionID, parentID: data.parentID ?? null, hasTitle: Boolean(data.title), directory: createdDir ?? null })
       }
       return
     }
@@ -464,6 +490,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         sessions.set(data.sessionID, {
           parentID: prev?.parentID,
           title: data.title,
+          directory: prev?.directory,
         })
         logger.debug("Session renamed", { id: data.sessionID })
       }
@@ -478,11 +505,77 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         errored.delete(data.sessionID)
         cancelIdleDebounce(data.sessionID)
         cancelPermissionDebounce(data.sessionID)
+        pending.delete(data.sessionID)
         logger.debug("Session cleaned up", { id: data.sessionID })
       }
       return
     }
 
+    // ---- Ownership gate ----
+    // OpenCode V2 boots one plugin instance per active location in a shared
+    // server, and every instance receives every event from the global bus.
+    // Only the instance whose directory owns the session may act on it;
+    // otherwise N locations would emit N duplicate notifications.
+    if (!sessionID) return
+    if (!sessions.has(sessionID)) sessions.set(sessionID, {})
+
+    // Seed the session's directory from the envelope location (authoritative
+    // for events published by the session's own location services).
+    if (eventDir) {
+      const info = sessions.get(sessionID)!
+      if (info.directory === undefined) info.directory = eventDir
+    }
+
+    const dir = sessions.get(sessionID)!.directory
+    if (dir === undefined) {
+      // Directory unknown (this instance booted after session.created was
+      // published). Resolve it asynchronously, serialized per session so
+      // event order is preserved.
+      if (!resolveSessionDir) {
+        // Legacy single-instance behavior: assume the session is local.
+        processSessionEvent(type, data, sessionID, eventDir)
+        return
+      }
+      const run = async () => {
+        const info = sessions.get(sessionID)
+        if (!info) return
+        let resolved = info.directory
+        if (resolved === undefined) {
+          try {
+            resolved = await resolveSessionDir(sessionID)
+          } catch (err) {
+            logger.debug("Session directory resolution failed", { sessionID, error: String(err) })
+            resolved = null
+          }
+          const fresh = sessions.get(sessionID)
+          if (fresh) fresh.directory = resolved
+        }
+        if (resolved !== projectDir) {
+          logger.debug("Foreign session — skipping", { sessionID, sessionDir: resolved })
+          return
+        }
+        processSessionEvent(type, data, sessionID, eventDir)
+      }
+      const prev = pending.get(sessionID) ?? Promise.resolve()
+      pending.set(sessionID, prev.then(run, run))
+      return
+    }
+
+    if (dir !== projectDir) {
+      logger.debug("Foreign session — skipping", { sessionID, sessionDir: dir })
+      return
+    }
+    processSessionEvent(type, data, sessionID, eventDir)
+  }
+
+  // Handles a session-scoped event — only called for sessions this instance
+  // owns (see the ownership gate in handleEvent).
+  function processSessionEvent(
+    type: string,
+    data: any,
+    sessionID: string | undefined,
+    eventDir: string | null,
+  ): void {
     // ---- Execution lifecycle: the real busy/idle signal on OpenCode ≤2.0.21 ----
     // session.status/session.idle exist in the schema but have no emitter in
     // 2.0.21 (marked deprecated); emitters were only added after 2.0.21. Drive
@@ -588,6 +681,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     for (const timer of permissionDebounce.values()) clearTimeout(timer)
     idleDebounce.clear()
     permissionDebounce.clear()
+    pending.clear()
     sessions.clear()
     active.clear()
     errored.clear()
@@ -617,7 +711,20 @@ export default Plugin.define({
         .map(([k]) => k),
     })
 
-    const notifier = createNotifier(config, logger, ctx.location.directory)
+    const notifier = createNotifier(config, logger, ctx.location.directory, {
+      // Ownership resolver: looks up which directory a session belongs to
+      // when this instance missed session.created (e.g. it booted after the
+      // session was created). OpenCode V2 runs one plugin instance per
+      // active location; without this, every instance would notify.
+      resolveSessionDir: async (sessionID) => {
+        try {
+          const info = await ctx.session.get({ sessionID })
+          return info?.location?.directory ?? null
+        } catch {
+          return null
+        }
+      },
+    })
     const controller = new AbortController()
 
     void (async () => {

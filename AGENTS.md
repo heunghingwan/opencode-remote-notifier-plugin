@@ -23,8 +23,9 @@ opencode-remote-notifier-plugin/
 
 | Task | Location | Notes |
 |------|----------|-------|
-| Plugin source | `.opencode/plugins/remote-notifier.ts` | 554 lines, everything in one file |
-| Plugin deps | `.opencode/package.json` | Only `@opencode-ai/plugin` |
+| Plugin source | `.opencode/plugins/remote-notifier.ts` | ~730 lines, everything in one file |
+| Plugin tests | `.opencode/test/remote-notifier.test.ts` | bun:test; run `bun test ./.opencode/test/` |
+| Plugin deps | `.opencode/package.json` | Only `@opencode/plugin` |
 | Plugin config template | `.opencode/notifier.json` | Reference only; real config at `~/.config/opencode/remote-notifier.json` |
 | User config spec | `README.md` | JSON fields, events, rate limiting |
 | npm metadata | `package.json` | Name, version, entry point, license |
@@ -37,12 +38,11 @@ opencode-remote-notifier-plugin/
 - **npm publishing wrapper**: Root `package.json` is publish metadata; `.opencode/` holds runtime deps.
 - **Config via XDG path**: Not environment variables — reads `~/.config/opencode/remote-notifier.json`.
 - **Events only**: Plugin implements only the `event` hook — no `tool`, `command`, or other hooks.
-- **Module-level mutable state**: Session tracking maps are global across events (no explicit lifecycle).
+- **Per-instance state**: All notifier state (session map, debounce timers, rate limiter) lives inside `createNotifier` — OpenCode V2 instantiates the plugin once per active location, so instances must not share mutable module state. Sessions are filtered by ownership: only the instance whose `ctx.location.directory` matches the session's directory notifies (see the ownership gate in `handleEvent`).
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
-- **No tests**: Zero test infrastructure. Event routing logic is untested.
-- **No typechecking**: No `tsconfig.json`, no `tsc` — type errors surface only at runtime.
+- **No typechecking**: No `tsconfig.json`, no `tsc` — type errors surface only at runtime (tests via Bun catch most).
 - **No linting/formatting**: No ESLint, Prettier, or EditorConfig.
 - **No CI/CD**: No automated checks on push. No release workflow.
 
