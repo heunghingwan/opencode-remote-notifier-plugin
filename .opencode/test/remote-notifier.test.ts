@@ -307,6 +307,110 @@ describe("idle notifications (V2 execution lifecycle)", () => {
   })
 })
 
+describe("idle notifications (sub-agent orchestration)", () => {
+  // The parent's execution ends when it hands off to a sub-agent (Task
+  // tool); the child session keeps working. The parent's idle signal in
+  // that window is a handoff, not genuine idleness — no notification.
+  const CHILD_ID = "ses_child456"
+  const execStarted = (sessionID: string) => ev("session.execution.started", { sessionID }, null)
+  const execSucceeded = (sessionID: string) => ev("session.execution.succeeded", { sessionID }, null)
+  const childCreated = () => sessionCreated({ parentID: SESSION_ID }, CHILD_ID)
+
+  test("parent idle is suppressed while a sub-agent child is still working", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(childCreated())
+    n.handleEvent(execStarted(CHILD_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // handoff idle — child still busy
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("a child going busy cancels the parent's pending idle debounce", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
+    n.handleEvent(childCreated())
+    n.handleEvent(execStarted(CHILD_ID)) // child starts — parent isn't really idle
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("the idle debounce re-checks for active children before firing", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
+    // The child's execution starts before this instance saw session.created,
+    // so its parentID is unknown at busy time; created arrives in-window.
+    n.handleEvent(execStarted(CHILD_ID))
+    n.handleEvent(childCreated())
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("parent notifies idle once the child finishes and its next turn completes", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // handoff
+    n.handleEvent(childCreated())
+    n.handleEvent(execStarted(CHILD_ID))
+    n.handleEvent(execSucceeded(CHILD_ID))
+    n.handleEvent(execStarted(SESSION_ID)) // parent resumes with the result
+    n.handleEvent(execSucceeded(SESSION_ID)) // genuine idle
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("OpenCode: Idle")
+  })
+
+  test("a failed child releases its busy state so the parent can still notify idle", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // handoff
+    n.handleEvent(childCreated())
+    n.handleEvent(execStarted(CHILD_ID))
+    n.handleEvent(executionFailed(CHILD_ID)) // child error — suppressed, must release busy
+    n.handleEvent(execStarted(SESSION_ID)) // parent resumes with the error result
+    n.handleEvent(execSucceeded(SESSION_ID)) // genuine idle
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("OpenCode: Idle")
+  })
+
+  test("a deleted child cancels the parent's pending idle debounce", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
+    n.handleEvent(childCreated())
+    n.handleEvent(ev("session.deleted", { sessionID: CHILD_ID })) // spawn aborted
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("parent idle via session.status is suppressed while a child is busy", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(busy(SESSION_ID))
+    n.handleEvent(childCreated())
+    n.handleEvent(busy(CHILD_ID))
+    n.handleEvent(idle(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+})
+
 describe("idle notifications (session.status, future OpenCode versions)", () => {
   test("sends an idle notification after the debounce window", async () => {
     const calls: SentCall[] = []

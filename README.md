@@ -69,7 +69,7 @@ opencode plugin list
 | `error` | Session execution failures (LLM failures, API errors) | 5 (urgent) |
 | `permission` | Agent requests permission to access files | 4 (high) |
 | `question` | Agent asks the user a question | 4 (high) |
-| `idle` | Session becomes idle/waiting for input | 3 (default) |
+| `idle` | Session becomes idle/waiting for input (suppressed while sub-agent children are still working — the parent's mid-handoff idle is not a real idle) | 3 (default) |
 
 ### Rate Limiting
 

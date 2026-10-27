@@ -213,10 +213,12 @@ async function sendNotification(payload: NotifyPayload, logger: Logger): Promise
 
 // ---- Session Tracking ----
 // Minimal parent/child + active/errored tracking, mirroring the mature pattern
-// used by opencode's built-in TUI notifications plugin. The OpenCode core
-// guarantees parent idle fires after foreground children finish, so we do NOT
-// implement our own parent/child join — we simply suppress any session whose
-// parentID is set (sub-agent sessions never notify).
+// used by opencode's built-in TUI notifications plugin. Sub-agent sessions
+// (parentID set) never notify themselves, and a parent's idle signal is
+// suppressed while any of its children is still active: when the parent hands
+// off to a sub-agent its execution ends and an idle fires, but that idle is a
+// tool-call handoff, not genuine idleness. The parent re-busies when the
+// child's result returns; its eventual genuine idle notifies then.
 
 interface SessionInfo {
   parentID?: string
@@ -374,6 +376,17 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     return Boolean(sessions.get(sessionID)?.parentID)
   }
 
+  // True while any sub-agent child of this session is still executing. Used
+  // to suppress the parent's idle notification: when the parent hands off to
+  // a sub-agent, the parent's execution ends and an idle signal fires even
+  // though the family is still working.
+  function hasActiveChild(parentID: string): boolean {
+    for (const id of active) {
+      if (sessions.get(id)?.parentID === parentID) return true
+    }
+    return false
+  }
+
   function dispatch(
     eventType: EventType,
     data: any,
@@ -409,8 +422,8 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   // Shared idle-signal handling. Called from both session.status idle and
   // session.execution.succeeded (the real signal on OpenCode ≤2.0.21, where
   // session.status has no emitter). Runs the mature suppress checks (no prior
-  // busy / trailing idle after error / sub-agent child) then schedules the
-  // idle debounce.
+  // busy / trailing idle after error / sub-agent child / parent with an active
+  // child) then schedules the idle debounce.
   function handleIdleSignal(sessionID: string, data: any, eventDir: string | null): void {
     // Suppress no-op idle (session was never busy first).
     if (!active.has(sessionID)) {
@@ -432,6 +445,14 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       return
     }
 
+    // Suppress the parent's idle while a sub-agent child is still working —
+    // this idle is the tool-call handoff, not genuine idleness. The parent
+    // re-busies when the child's result returns.
+    if (hasActiveChild(sessionID)) {
+      logger.debug("Parent idle while child active — suppressing", { sessionID })
+      return
+    }
+
     if (!config.events.idle.enabled) return
 
     // Schedule idle debounce — another plugin (or the user) may resume the
@@ -440,6 +461,12 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     cancelIdleDebounce(sessionID)
     const timer = setTimeout(() => {
       idleDebounce.delete(sessionID)
+      // Re-check at fire time: a sub-agent may have started between the idle
+      // signal and now (cross-session event ordering is not guaranteed).
+      if (hasActiveChild(sessionID)) {
+        logger.debug("Idle debounce fired with child active — suppressing", { sessionID })
+        return
+      }
       logger.debug("Idle debounce fired", { sessionID })
       dispatch("idle", data, sessionID, eventDir)
     }, idleDebounceMs)
@@ -451,6 +478,12 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     active.add(sessionID)
     errored.delete(sessionID)
     cancelIdleDebounce(sessionID)
+    // A child going busy means the parent's pending idle signal was a
+    // sub-agent handoff, not genuine idleness — cancel the parent's idle
+    // notification. Covers the race where the child's execution starts after
+    // the parent's idle signal but before its debounce fires.
+    const parentID = sessions.get(sessionID)?.parentID
+    if (parentID) cancelIdleDebounce(parentID)
   }
 
   // ---- Event Handler ----
@@ -500,10 +533,14 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     // ---- session.deleted: release all tracking state for this session ----
     if (type === "session.deleted") {
       if (data?.sessionID) {
+        // A deleted child can no longer keep working — cancel the parent's
+        // pending idle notification; the parent re-busies with the result.
+        const parentID = sessions.get(data.sessionID)?.parentID
         sessions.delete(data.sessionID)
         active.delete(data.sessionID)
         errored.delete(data.sessionID)
         cancelIdleDebounce(data.sessionID)
+        if (parentID) cancelIdleDebounce(parentID)
         cancelPermissionDebounce(data.sessionID)
         pending.delete(data.sessionID)
         logger.debug("Session cleaned up", { id: data.sessionID })
@@ -650,6 +687,10 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
 
     // ---- Error: send immediately (and suppress the trailing idle) ----
     if (type === "session.execution.failed") {
+      // Terminal event — always release the busy state, even for suppressed
+      // child sessions, so a dead child can't hold the parent's idle
+      // notification hostage forever.
+      if (sessionID) active.delete(sessionID)
       if (!config.events.error.enabled) return
       if (isChildSession(sessionID)) {
         logger.debug("Child session error — suppressing", { sessionID })
