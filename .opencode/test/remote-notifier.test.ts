@@ -139,10 +139,10 @@ describe("error notifications", () => {
     n.handleEvent(busy())
     n.handleEvent(executionFailed())
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Error")
+    expect(calls[0]!.title).toBe("🚨 Error")
     expect(calls[0]!.message).toContain("provider rate limited")
     expect(calls[0]!.priority).toBe(5)
-    expect(calls[0]!.tags).toEqual(["rotating_light", "x"])
+    expect(calls[0]!.tags).toEqual([])
   })
 
   test("suppresses the trailing idle that follows an error", async () => {
@@ -176,7 +176,7 @@ describe("permission notifications", () => {
     expect(calls.length).toBe(0)
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Permission")
+    expect(calls[0]!.title).toBe("🔐 Permission")
     expect(calls[0]!.message).toContain("`edit` on `src/a.ts`")
     expect(calls[0]!.priority).toBe(4)
   })
@@ -210,7 +210,7 @@ describe("question notifications", () => {
     n.handleEvent(sessionCreated())
     n.handleEvent(formCreated())
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Question")
+    expect(calls[0]!.title).toBe("❓ Question")
     expect(calls[0]!.message).toContain("Which database?")
     expect(calls[0]!.priority).toBe(4)
   })
@@ -221,7 +221,7 @@ describe("question notifications", () => {
     n.handleEvent(sessionCreated())
     n.handleEvent(ev("session.renamed", { sessionID: SESSION_ID, title: "Fix login bug" }))
     n.handleEvent(formCreated())
-    expect(calls[0]!.title).toBe("OpenCode: Question - Fix login bug")
+    expect(calls[0]!.title).toBe("❓ Fix login bug")
   })
 })
 
@@ -239,7 +239,7 @@ describe("idle notifications (V2 execution lifecycle)", () => {
     expect(calls.length).toBe(0)
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Idle")
+    expect(calls[0]!.title).toBe("💤 Idle")
     expect(calls[0]!.priority).toBe(3)
   })
 
@@ -260,7 +260,7 @@ describe("idle notifications (V2 execution lifecycle)", () => {
     n.handleEvent(executionFailed())
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Error")
+    expect(calls[0]!.title).toBe("🚨 Error")
   })
 
   test("a new execution.started cancels a pending idle debounce", async () => {
@@ -303,7 +303,7 @@ describe("idle notifications (V2 execution lifecycle)", () => {
     n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Idle - Fix login bug")
+    expect(calls[0]!.title).toBe("💤 Fix login bug")
   })
 })
 
@@ -367,7 +367,7 @@ describe("idle notifications (sub-agent orchestration)", () => {
     n.handleEvent(execSucceeded(SESSION_ID)) // genuine idle
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Idle")
+    expect(calls[0]!.title).toBe("💤 Idle")
   })
 
   test("a failed child releases its busy state so the parent can still notify idle", async () => {
@@ -383,7 +383,7 @@ describe("idle notifications (sub-agent orchestration)", () => {
     n.handleEvent(execSucceeded(SESSION_ID)) // genuine idle
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Idle")
+    expect(calls[0]!.title).toBe("💤 Idle")
   })
 
   test("a deleted child cancels the parent's pending idle debounce", async () => {
@@ -421,7 +421,7 @@ describe("idle notifications (session.status, future OpenCode versions)", () => 
     expect(calls.length).toBe(0)
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.title).toBe("OpenCode: Idle")
+    expect(calls[0]!.title).toBe("💤 Idle")
     expect(calls[0]!.priority).toBe(3)
   })
 
@@ -538,23 +538,25 @@ describe("multi-location ownership (one plugin instance per location)", () => {
     const calls: SentCall[] = []
     let resolved = 0
     const n = makeNotifier((p) => calls.push(p), "/home/dev/work/alpha", {
-      resolveSessionDir: async () => {
+      resolveSession: async () => {
         resolved++
-        return "/home/dev/work/alpha"
+        return { directory: "/home/dev/work/alpha", title: null }
       },
     })
     n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, null))
     n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, null))
     expect(calls.length).toBe(0)
     await sleep(60)
-    expect(resolved).toBe(1)
+    // One fetch resolves ownership; the idle dispatch may fetch once more to
+    // backfill a title the first lookup didn't have yet.
+    expect(resolved).toBeGreaterThanOrEqual(1)
     expect(calls.length).toBe(1)
   })
 
   test("a resolved foreign session sends nothing", async () => {
     const calls: SentCall[] = []
     const n = makeNotifier((p) => calls.push(p), "/home/dev/work/alpha", {
-      resolveSessionDir: async () => "/home/dev/work/beta",
+      resolveSession: async () => ({ directory: "/home/dev/work/beta", title: "Other" }),
     })
     n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, null))
     n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, null))
@@ -570,6 +572,73 @@ describe("multi-location ownership (one plugin instance per location)", () => {
     await sleep(50)
     expect(calls.length).toBe(1)
     expect(calls[0]!.message).toContain("**gamma**")
+  })
+})
+
+// ---- Title backfill ----
+// OpenCode generates a session's real title with an async LLM call and
+// publishes session.renamed exactly once. A plugin instance that boots after
+// that (server restart, plugin reload, late location activation) never sees
+// the event, so the title must be fetched from the session API at dispatch
+// time instead of being blank forever.
+
+describe("title backfill via the session API", () => {
+  test("idle dispatch uses a title fetched when session.renamed was missed", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), "/home/dev/work/alpha", {
+      resolveSession: async () => ({ directory: "/home/dev/work/alpha", title: "Fix login bug" }),
+    })
+    // No session.created / session.renamed seen: the instance booted late.
+    // The envelope location seeds ownership synchronously.
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, "/home/dev/work/alpha"))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, "/home/dev/work/alpha"))
+    await sleep(60)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("💤 Fix login bug")
+  })
+
+  test("immediate error dispatch awaits the title backfill", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), "/home/dev/work/alpha", {
+      resolveSession: async () => ({ directory: "/home/dev/work/alpha", title: "Mid-session crash" }),
+    })
+    n.handleEvent(ev("session.execution.failed", {
+      sessionID: SESSION_ID,
+      error: { type: "provider.error", message: "boom" },
+    }, "/home/dev/work/alpha"))
+    await sleep(30)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("🚨 Mid-session crash")
+  })
+
+  test("a fresher session.renamed is not clobbered by a stale in-flight fetch", async () => {
+    const calls: SentCall[] = []
+    let releaseFetch!: (value: { directory: string; title: string }) => void
+    const n = makeNotifier((p) => calls.push(p), "/home/dev/work/alpha", {
+      resolveSession: () => new Promise((resolve) => { releaseFetch = resolve }),
+    })
+    n.handleEvent(ev("session.execution.failed", {
+      sessionID: SESSION_ID,
+      error: { type: "provider.error", message: "boom" },
+    }, "/home/dev/work/alpha"))
+    // renamed wins the race against the still-pending API fetch
+    n.handleEvent(ev("session.renamed", { sessionID: SESSION_ID, title: "Fresh title" }, "/home/dev/work/alpha"))
+    releaseFetch({ directory: "/home/dev/work/alpha", title: "Stale title" })
+    await sleep(30)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("🚨 Fresh title")
+  })
+
+  test("a default title from the API is treated as absent", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), "/home/dev/work/alpha", {
+      resolveSession: async () => ({ directory: "/home/dev/work/alpha", title: "New session - 2026-10-01T10:00:00" }),
+    })
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, "/home/dev/work/alpha"))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, "/home/dev/work/alpha"))
+    await sleep(60)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("💤 Idle")
   })
 })
 
@@ -595,7 +664,7 @@ describe("plugin setup wiring", () => {
       session: {
         get: async ({ sessionID }: { sessionID: string }) => {
           sessionGets++
-          return { id: sessionID, location: { directory: "/home/dev/work/alpha" } }
+          return { id: sessionID, location: { directory: "/home/dev/work/alpha" }, title: "Wired title" }
         },
       },
       event: {
@@ -633,7 +702,7 @@ describe("buildMessage", () => {
 
   test("error message embeds the error text in a code block", () => {
     const { title, message } = buildMessage(config, "error", withProject({ error: { type: "provider.error", message: "boom", status: 429 } }), "Fix login")
-    expect(title).toBe("OpenCode: Error - Fix login")
+    expect(title).toBe("🚨 Fix login")
     expect(message).toBe("**alpha**\n\n⚠️ **Error**\n\n```\nboom\n```")
   })
 
@@ -650,7 +719,7 @@ describe("buildMessage", () => {
   test("idle message in plain text mode", () => {
     const plain = { ...config, markdown: false }
     const { title, message } = buildMessage(plain, "idle", withProject({}), "New session - 2026-10-01T10:00:00")
-    expect(title).toBe("OpenCode: Idle")
+    expect(title).toBe("💤 Idle")
     expect(message).toBe("[alpha] Idle — session waiting for input")
   })
 })

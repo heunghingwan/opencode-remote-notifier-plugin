@@ -7,7 +7,8 @@ Built for **OpenCode V2** (v2.0.21+). The V1 plugin API is not supported.
 ## Features
 
 - **4 event types**: session errors, permission requests, questions, idle notifications
-- **Session titles**: automatically includes the conversation title (supports Unicode/Chinese)
+- **Compact titles**: `emoji + conversation title` (e.g. `💤 Fix login bug`) — no long prefix, so the session name stays visible on the phone's notification bar
+- **Session titles**: automatically includes the conversation title (supports Unicode/Chinese); when the title event was missed (server restart, plugin reload), it is fetched from the session API before notifying
 - **Rate limiting**: configurable dedup window and max notifications per minute
 - **Retry**: auto-retries up to 3 times with exponential backoff
 - **Markdown**: notification bodies support Markdown formatting
@@ -82,7 +83,8 @@ The plugin subscribes to OpenCode's V2 server event stream (`ctx.event.subscribe
 
 1. `session.created` events are intercepted to cache the session's title and parent (sub-agent sessions are silenced)
 2. `session.renamed` events update the cached title; when a notification fires, the real title is included
-3. If the title is still the auto-generated default (`New session - ...`), only the generic event title is sent
+3. If the title is still the auto-generated default (`New session - ...`) or unknown, the title falls back to the short event label (e.g. `💤 Idle`)
+4. `session.renamed` fires exactly once per session — if the instance subscribed after that (server restart, plugin reload, late location activation), the title is fetched via `ctx.session.get` right before notifying, so it is never silently blank
 
 Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle).
 

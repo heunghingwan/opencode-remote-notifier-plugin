@@ -236,18 +236,22 @@ interface SessionInfo {
 
 // ---- Event constants & message builder ----
 
-const EVENT_TAGS: Record<EventType, string[]> = {
-  error:      ["rotating_light", "x"],
-  permission: ["lock", "key"],
-  question:   ["question", "grey_question"],
-  idle:       ["zzz", "sleeping"],
+// One emoji per event type is the whole title prefix — phone notification
+// bars truncate early, so "opencode"/type words are deliberately omitted.
+// ntfy tag emojis are not sent: the in-title emoji is the single icon.
+const EVENT_EMOJI: Record<EventType, string> = {
+  error:      "🚨",
+  permission: "🔐",
+  question:   "❓",
+  idle:       "💤",
 }
 
-const EVENT_TITLES: Record<EventType, string> = {
-  error:      "OpenCode: Error",
-  permission: "OpenCode: Permission",
-  question:   "OpenCode: Question",
-  idle:       "OpenCode: Idle",
+// Fallback label used only when the session's real title is unknown.
+const EVENT_LABELS: Record<EventType, string> = {
+  error:      "Error",
+  permission: "Permission",
+  question:   "Question",
+  idle:       "Idle",
 }
 
 function isDefaultTitle(title: string): boolean {
@@ -260,9 +264,9 @@ function isDefaultTitle(title: string): boolean {
 //   question   form.created              data.form.{sessionID, title}
 //   idle       session.status            data.{sessionID, status.type}
 export function buildMessage(config: Config, type: EventType, payload: any, sessionTitle?: string | null): { title: string; message: string } {
-  const baseTitle = EVENT_TITLES[type]
-  const effectiveTitle = sessionTitle && !isDefaultTitle(sessionTitle) ? sessionTitle : null
-  const title = effectiveTitle ? `${baseTitle} - ${effectiveTitle}` : baseTitle
+  const emoji = EVENT_EMOJI[type]
+  const effectiveTitle = sessionTitle && !isDefaultTitle(sessionTitle) ? sessionTitle : EVENT_LABELS[type]
+  const title = `${emoji} ${effectiveTitle}`
   const md = config.markdown
 
   switch (type) {
@@ -325,19 +329,22 @@ export interface NotifierDeps {
   idleDebounceMs?: number
   permissionDebounceMs?: number
   /**
-   * Resolves a session's location directory when it wasn't learned from
-   * events (e.g. this instance booted after session.created was published).
-   * Production wiring uses ctx.session.get. Without it, sessions of unknown
-   * directory are treated as local (legacy single-instance behavior).
+   * Fetches a session's location directory and title from the session API.
+   * Used when they weren't learned from events: the directory when this
+   * instance booted after session.created, and the title when session.renamed
+   * already fired before the instance subscribed (OpenCode publishes it
+   * exactly once). Production wiring uses ctx.session.get. Without it,
+   * sessions of unknown directory are treated as local (legacy
+   * single-instance behavior) and unknown titles fall back to the event label.
    */
-  resolveSessionDir?: (sessionID: string) => Promise<string | null>
+  resolveSession?: (sessionID: string) => Promise<{ directory: string | null; title?: string | null } | null>
 }
 
 export function createNotifier(config: Config, logger: Logger, projectDir: string, deps: NotifierDeps = {}) {
   const send = deps.sender ?? ((payload: NotifyPayload) => sendNotification(payload, logger))
   const idleDebounceMs = deps.idleDebounceMs ?? IDLE_DEBOUNCE_MS
   const permissionDebounceMs = deps.permissionDebounceMs ?? PERMISSION_DEBOUNCE_MS
-  const resolveSessionDir = deps.resolveSessionDir
+  const resolveSession = deps.resolveSession
   const limiter = new RateLimiter(config.rateLimit.dedupWindowSec, config.rateLimit.maxPerMinute, logger)
 
   const sessions = new Map<string, SessionInfo>()
@@ -354,6 +361,8 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   // Serializes async ownership resolution per session so events keep their
   // order (started must be processed before succeeded).
   const pending = new Map<string, Promise<void>>()
+  // In-flight session API lookups backing ensureTitle, deduped per session.
+  const sessionFetches = new Map<string, Promise<void>>()
 
   function cancelIdleDebounce(sessionID: string): void {
     const timer = idleDebounce.get(sessionID)
@@ -387,6 +396,58 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     return false
   }
 
+  // Backfills the session's title (and directory, when unknown) from the
+  // session API. session.renamed fires exactly once per session — if this
+  // instance subscribed after that (server restart, plugin reload, late
+  // location activation), the API is the only way to ever learn the title.
+  // Dedups in-flight per session; a session.renamed arriving during a fetch
+  // always wins (the merge only fills unknown titles).
+  function ensureTitle(sessionID: string): Promise<void> {
+    const info = sessions.get(sessionID)
+    if (!info || info.title !== undefined || !resolveSession) return Promise.resolve()
+    let fetch = sessionFetches.get(sessionID)
+    if (!fetch) {
+      fetch = (async () => {
+        try {
+          const fetched = await resolveSession(sessionID)
+          const fresh = sessions.get(sessionID)
+          if (!fetched || !fresh) return
+          if (fresh.directory === undefined && fetched.directory) {
+            fresh.directory = fetched.directory
+          }
+          if (fresh.title == null && fetched.title && !isDefaultTitle(fetched.title)) {
+            fresh.title = fetched.title
+            logger.debug("Session title backfilled", { sessionID })
+          }
+        } catch (err) {
+          logger.debug("Session title resolution failed", { sessionID, error: String(err) })
+        } finally {
+          sessionFetches.delete(sessionID)
+        }
+      })()
+      sessionFetches.set(sessionID, fetch)
+    }
+    return fetch
+  }
+
+  // Dispatch that first backfills an unknown session title, so notifications
+  // carry the real conversation title even when session.renamed was missed.
+  // Stays synchronous when there is nothing to fetch (no resolver, unknown
+  // session, or title already learned) to preserve immediate delivery.
+  function dispatchWithTitle(
+    eventType: EventType,
+    data: any,
+    sessionID: string | undefined,
+    eventDir: string | null,
+  ): void {
+    const info = sessionID ? sessions.get(sessionID) : undefined
+    if (!sessionID || !info || info.title !== undefined || !resolveSession) {
+      dispatch(eventType, data, sessionID, eventDir)
+      return
+    }
+    void ensureTitle(sessionID).then(() => dispatch(eventType, data, sessionID, eventDir))
+  }
+
   function dispatch(
     eventType: EventType,
     data: any,
@@ -415,7 +476,9 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       title,
       message,
       priority: config.events[eventType].priority,
-      tags: EVENT_TAGS[eventType],
+      // The title already carries the single event emoji; ntfy tag emojis
+      // would only duplicate it in the notification row.
+      tags: [],
     })
   }
 
@@ -468,7 +531,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         return
       }
       logger.debug("Idle debounce fired", { sessionID })
-      dispatch("idle", data, sessionID, eventDir)
+      dispatchWithTitle("idle", data, sessionID, eventDir)
     }, idleDebounceMs)
     idleDebounce.set(sessionID, timer)
     logger.debug("Idle debounce scheduled", { sessionID, ms: idleDebounceMs })
@@ -568,7 +631,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       // Directory unknown (this instance booted after session.created was
       // published). Resolve it asynchronously, serialized per session so
       // event order is preserved.
-      if (!resolveSessionDir) {
+      if (!resolveSession) {
         // Legacy single-instance behavior: assume the session is local.
         processSessionEvent(type, data, sessionID, eventDir)
         return
@@ -577,15 +640,23 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         const info = sessions.get(sessionID)
         if (!info) return
         let resolved = info.directory
+        let fetched: Awaited<ReturnType<NonNullable<typeof resolveSession>>> = null
         if (resolved === undefined) {
           try {
-            resolved = await resolveSessionDir(sessionID)
+            fetched = await resolveSession(sessionID)
+            resolved = fetched?.directory ?? null
           } catch (err) {
             logger.debug("Session directory resolution failed", { sessionID, error: String(err) })
             resolved = null
           }
           const fresh = sessions.get(sessionID)
-          if (fresh) fresh.directory = resolved
+          if (fresh) {
+            fresh.directory = resolved
+            // The same lookup can fill a never-learned title (missed rename).
+            if (fetched?.title && fresh.title == null && !isDefaultTitle(fetched.title)) {
+              fresh.title = fetched.title
+            }
+          }
         }
         if (resolved !== projectDir) {
           logger.debug("Foreign session — skipping", { sessionID, sessionDir: resolved })
@@ -668,7 +739,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       const timer = setTimeout(() => {
         permissionDebounce.delete(key)
         logger.debug("Permission debounce fired", { sessionID: key })
-        dispatch("permission", data, sessionID, eventDir)
+        dispatchWithTitle("permission", data, sessionID, eventDir)
       }, permissionDebounceMs)
       permissionDebounce.set(key, timer)
       logger.debug("Permission debounce scheduled", { sessionID: key, ms: permissionDebounceMs })
@@ -700,7 +771,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         errored.add(sessionID)
         cancelIdleDebounce(sessionID)
       }
-      dispatch("error", data, sessionID, eventDir)
+      dispatchWithTitle("error", data, sessionID, eventDir)
       return
     }
 
@@ -712,7 +783,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         return
       }
       if (sessionID) cancelIdleDebounce(sessionID)
-      dispatch("question", data, sessionID, eventDir)
+      dispatchWithTitle("question", data, sessionID, eventDir)
       return
     }
   }
@@ -723,6 +794,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     idleDebounce.clear()
     permissionDebounce.clear()
     pending.clear()
+    sessionFetches.clear()
     sessions.clear()
     active.clear()
     errored.clear()
@@ -753,14 +825,16 @@ export default Plugin.define({
     })
 
     const notifier = createNotifier(config, logger, ctx.location.directory, {
-      // Ownership resolver: looks up which directory a session belongs to
-      // when this instance missed session.created (e.g. it booted after the
-      // session was created). OpenCode V2 runs one plugin instance per
-      // active location; without this, every instance would notify.
-      resolveSessionDir: async (sessionID) => {
+      // Ownership + title resolver: looks up which directory a session
+      // belongs to when this instance missed session.created, and the
+      // session's current title when session.renamed already fired before
+      // this instance subscribed (OpenCode publishes it exactly once).
+      // OpenCode V2 runs one plugin instance per active location; without
+      // the directory check, every instance would notify.
+      resolveSession: async (sessionID) => {
         try {
           const info = await ctx.session.get({ sessionID })
-          return info?.location?.directory ?? null
+          return { directory: info?.location?.directory ?? null, title: info?.title ?? null }
         } catch {
           return null
         }
