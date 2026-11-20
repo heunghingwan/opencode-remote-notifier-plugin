@@ -622,12 +622,27 @@ describe("idle notifications (background shell waiting)", () => {
   const execStarted = (sessionID: string) => ev("session.execution.started", { sessionID }, null)
   const execSucceeded = (sessionID: string) => ev("session.execution.succeeded", { sessionID }, null)
 
+  // OpenCode v2.3 payload shapes (verified live against 2.3.0):
+  // session.tool.input.started carries the tool NAME; session.tool.called
+  // carries the parsed input but NO name, and executed=false for every
+  // locally executed tool (the shell tool always executes locally).
+  const shellToolInputStarted = (sessionID = SESSION_ID, callID = "call_1") =>
+    ev("session.tool.input.started", { sessionID, assistantMessageID: "msg_1", id: callID, name: "shell" })
   const shellToolCalled = (
     sessionID = SESSION_ID,
     callID = "call_1",
     input: Record<string, unknown> = { command: "bun test", background: true },
   ) =>
-    ev("session.tool.called", { sessionID, assistantMessageID: "msg_1", id: callID, name: "shell", input, executed: true })
+    ev("session.tool.called", { sessionID, assistantMessageID: "msg_1", id: callID, input, executed: false })
+  const emitShellCall = (
+    n: ReturnType<typeof makeNotifier>,
+    sessionID = SESSION_ID,
+    callID = "call_1",
+    input?: Record<string, unknown>,
+  ) => {
+    n.handleEvent(shellToolInputStarted(sessionID, callID))
+    n.handleEvent(shellToolCalled(sessionID, callID, input))
+  }
   const shellToolProgress = (shellID: string, sessionID = SESSION_ID, callID = "call_1") =>
     ev("session.tool.progress", { sessionID, assistantMessageID: "msg_1", id: callID, metadata: { shellID } })
   const shellToolSuccess = (shellID: string | null, sessionID = SESSION_ID, callID = "call_1") =>
@@ -645,7 +660,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
@@ -657,7 +672,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled(SESSION_ID, "call_1", { command: "ls" }))
+    emitShellCall(n, SESSION_ID, "call_1", { command: "ls" })
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
@@ -669,7 +684,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled(SESSION_ID, "call_1", { command: "bun test", timeout: 60000, background: true }))
+    emitShellCall(n, SESSION_ID, "call_1", { command: "bun test", timeout: 60000, background: true })
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
@@ -681,7 +696,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(
       ev("session.tool.failed", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", error: { message: "permission denied" } }),
     )
@@ -698,7 +713,7 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
     // The background shell is registered after the idle signal but before
     // the debounce fires — the fire-time re-check must catch it.
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     await sleep(50)
     expect(calls.length).toBe(0)
@@ -708,7 +723,8 @@ describe("idle notifications (background shell waiting)", () => {
     const calls: SentCall[] = []
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(ev("session.created", { sessionID: "ses_other", title: "New session - 2026-10-01T10:00:00", location: { directory: "/home/dev/work/beta" } }, "/home/dev/work/beta"))
-    n.handleEvent(ev("session.tool.called", { sessionID: "ses_other", assistantMessageID: "msg_1", id: "call_x", name: "shell", input: { command: "bun test", background: true }, executed: true }, "/home/dev/work/beta"))
+    n.handleEvent(ev("session.tool.input.started", { sessionID: "ses_other", assistantMessageID: "msg_1", id: "call_x", name: "shell" }, "/home/dev/work/beta"))
+    n.handleEvent(ev("session.tool.called", { sessionID: "ses_other", assistantMessageID: "msg_1", id: "call_x", input: { command: "bun test", background: true }, executed: false }, "/home/dev/work/beta"))
     n.handleEvent(ev("session.tool.progress", { sessionID: "ses_other", assistantMessageID: "msg_1", id: "call_x", metadata: { shellID: "shl_x" } }, "/home/dev/work/beta"))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
@@ -723,7 +739,7 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(sessionCreated())
     n.handleEvent(sessionCreated({ parentID: SESSION_ID }, "ses_child"))
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled("ses_child"))
+    emitShellCall(n, "ses_child")
     n.handleEvent(shellToolProgress("shl_1", "ses_child"))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
@@ -735,7 +751,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(shellToolProgress("shl_2"))
     n.handleEvent(shellToolSuccess("shl_2")) // callID entry released; shells stay
@@ -762,7 +778,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
     n.handleEvent(shellExited("shl_1")) // wake is imminent — no execution.started follows here
@@ -775,7 +791,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID)) // suppressed wait
     n.handleEvent(shellExited("shl_1"))
@@ -791,7 +807,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
@@ -808,7 +824,7 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID))
     n.handleEvent(shellExited("shl_1"))
@@ -823,7 +839,7 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(sessionCreated())
     n.handleEvent(sessionCreated({ parentID: SESSION_ID }, "ses_child"))
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled("ses_child"))
+    emitShellCall(n, "ses_child")
     n.handleEvent(shellToolProgress("shl_1", "ses_child"))
     n.handleEvent(execSucceeded(SESSION_ID)) // suppressed by the child's shell
     await sleep(50)
@@ -842,7 +858,8 @@ describe("idle notifications (background shell waiting)", () => {
     const n = makeNotifier((p) => calls.push(p), PLUGIN_DIR, {
       resolveSession: async () => ({ directory: PLUGIN_DIR }),
     })
-    n.handleEvent(ev("session.tool.called", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", name: "shell", input: { command: "false", background: true }, executed: true }, null))
+    n.handleEvent(ev("session.tool.input.started", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", name: "shell" }, null))
+    n.handleEvent(ev("session.tool.called", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", input: { command: "false", background: true }, executed: false }, null))
     n.handleEvent(ev("session.tool.progress", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", metadata: { shellID: "shl_1" } }, null))
     // The fast-failing shell exits while the fetch is still in flight —
     // the shell is not registered yet, so this is a no-op on its own.
@@ -864,7 +881,7 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(execStarted(SESSION_ID))
     n.handleEvent(execSucceeded(SESSION_ID)) // schedules the parent's idle debounce
     // The child's background shell registers inside the debounce window.
-    n.handleEvent(shellToolCalled("ses_child"))
+    emitShellCall(n, "ses_child")
     n.handleEvent(shellToolProgress("shl_1", "ses_child"))
     // The shell exits; the child wakes and the family keeps working. The
     // parent's pending debounce must be cancelled, not fire in the gap
@@ -874,17 +891,23 @@ describe("idle notifications (background shell waiting)", () => {
     expect(calls.length).toBe(0)
   })
 
-  test("a tool call that never executed does not suppress idle", async () => {
+  test("a tool call denied before execution does not suppress idle", async () => {
     const calls: SentCall[] = []
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(ev("session.tool.called", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", name: "shell", input: { command: "rm -rf /", background: true }, executed: false }))
-    n.handleEvent(shellToolProgress("shl_1"))
+    // v2.3 denied-call sequence: called (executed=false — locally executed
+    // tools always are), then tool.failed when permission is refused. No
+    // shell ever exists, so no progress/success can carry a shellID.
+    n.handleEvent(shellToolInputStarted())
+    n.handleEvent(shellToolCalled())
+    n.handleEvent(
+      ev("session.tool.failed", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", error: { message: "permission denied" } }),
+    )
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
-    // No shell was ever spawned (the call was denied before execution), so
-    // nothing will wake the session — this is genuine idleness.
+    // No shell was ever spawned, so nothing will wake the session — this is
+    // genuine idleness.
     expect(calls.length).toBe(1)
   })
 
@@ -902,7 +925,7 @@ describe("idle notifications (background shell waiting)", () => {
     })
     n.handleEvent(sessionCreated())
     n.handleEvent(ev("session.execution.started", { sessionID: "ses_child" })) // first sight of the child
-    n.handleEvent(shellToolCalled("ses_child"))
+    emitShellCall(n, "ses_child")
     n.handleEvent(shellToolProgress("shl_1", "ses_child"))
     n.handleEvent(execStarted(SESSION_ID))
     n.handleEvent(execSucceeded(SESSION_ID)) // parent idle signal — child fetch still in flight
@@ -916,7 +939,7 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(sessionCreated())
     n.handleEvent(ev("session.renamed", { sessionID: SESSION_ID, title: "Fix login bug" }))
     n.handleEvent(execStarted(SESSION_ID))
-    n.handleEvent(shellToolCalled())
+    emitShellCall(n)
     n.handleEvent(shellToolProgress("shl_1"))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(40)

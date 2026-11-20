@@ -422,6 +422,11 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   // correlation has to live here as shellID → sessionID.
   const bgToolCalls = new Map<string, string>()
   const backgroundShells = new Map<string, string>()
+  // Call IDs of shell-tool calls, learned from session.tool.input.started.
+  // OpenCode v2.3's session.tool.called payload carries NO tool name (the
+  // name only appears on input.started), so the shell identification needs
+  // this companion set.
+  const shellCallIDs = new Set<string>()
   // Exits seen for shells this instance never registered. Registration is
   // deferred behind the async directory fetch, so an exit can land first —
   // without this, the queued registration would resurrect a dead shell and
@@ -771,7 +776,10 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
           if (owner === data.sessionID) backgroundShells.delete(shellID)
         }
         for (const [callID, owner] of bgToolCalls) {
-          if (owner === data.sessionID) bgToolCalls.delete(callID)
+          if (owner === data.sessionID) {
+            bgToolCalls.delete(callID)
+            shellCallIDs.delete(callID)
+          }
         }
         cancelIdleDebounce(data.sessionID)
         if (parentID) cancelIdleDebounce(parentID)
@@ -864,20 +872,32 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     }
 
     // ---- Background shell tracking ----
-    // session.tool.called is the only reliable foreground/background signal
-    // (shell.created's metadata carries just {sessionID} for both kinds);
-    // progress/success then reveal the shellID. shell.exited/deleted later
-    // carry only {id}, so the correlation is kept in backgroundShells.
+    // The shell tool is identified by session.tool.input.started (OpenCode
+    // v2.3's tool.called payload has no name field; older versions put the
+    // name directly on called, which is still accepted). input.background
+    // marks the call as background. progress/success then reveal the
+    // shellID. shell.exited/deleted later carry only {id}, so the
+    // correlation is kept in backgroundShells.
+    //
+    // NOTE on `executed`: in v2.3 it means "executed by the provider", and
+    // the shell tool always executes locally — so it is false for every
+    // real shell call. It must NOT gate registration. A denied call never
+    // spawns a shell, so no progress/success ever links a shellID to it;
+    // tool.failed drops the entry.
+    if (type === "session.tool.input.started") {
+      if (sessionID && data?.name === "shell" && typeof data?.id === "string") {
+        shellCallIDs.add(data.id)
+      }
+      return
+    }
+
     if (type === "session.tool.called") {
       if (
         sessionID &&
-        data?.name === "shell" &&
-        data?.input?.background === true &&
-        data?.executed !== false &&
-        typeof data?.id === "string"
+        typeof data?.id === "string" &&
+        (data?.name === "shell" || shellCallIDs.has(data.id)) &&
+        data?.input?.background === true
       ) {
-        // executed:false means the call was denied before running — no
-        // shell will exist, so it must never contribute suppression.
         bgToolCalls.set(data.id, sessionID)
         logger.debug("Background shell tool call seen", { sessionID, callID: data.id })
       }
@@ -906,6 +926,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     if (type === "session.tool.success" || type === "session.tool.failed") {
       const callID = data?.id
       if (typeof callID === "string") {
+        shellCallIDs.delete(callID)
         const owner = bgToolCalls.get(callID)
         if (owner) {
           // Progress is ephemeral and can be missed; success metadata repeats
@@ -1039,6 +1060,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     sessionFetches.clear()
     lastText.clear()
     bgToolCalls.clear()
+    shellCallIDs.clear()
     backgroundShells.clear()
     recentShellExits.clear()
     sessions.clear()
@@ -1059,6 +1081,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     permissionDebounce.clear()
     lastText.clear()
     bgToolCalls.clear()
+    shellCallIDs.clear()
     backgroundShells.clear()
     recentShellExits.clear()
     active.clear()
