@@ -712,11 +712,21 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         const owner = backgroundShells.get(shellID)
         if (owner) {
           backgroundShells.delete(shellID)
-          // An exited shell wakes its session (synthetic message with
-          // resume) within milliseconds — cancel the debounce rather than
-          // race it. A deleted (killed) running shell wakes the same way
-          // with a "Cancelled" notice. Duplicate events are no-ops.
+          // An exited shell wakes its owning session (synthetic message
+          // with resume) within milliseconds — cancel the debounce rather
+          // than race it. A deleted (killed) running shell wakes the same
+          // way with a "Cancelled" notice. Duplicate events are no-ops.
           cancelIdleDebounce(owner)
+          // Suppression considers descendant sessions, so release must
+          // mirror it: cancel the whole ancestor chain's pending debounces
+          // too — the woken descendant keeps the family working.
+          let ancestor = sessions.get(owner)?.parentID
+          const seen = new Set<string>()
+          while (ancestor !== undefined && !seen.has(ancestor)) {
+            seen.add(ancestor)
+            cancelIdleDebounce(ancestor)
+            ancestor = sessions.get(ancestor)?.parentID
+          }
           logger.debug("Background shell released", { shellID, sessionID: owner, via: type })
         } else {
           // Unregistered (yet): remember it so a deferred registration of
@@ -853,8 +863,11 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         sessionID &&
         data?.name === "shell" &&
         data?.input?.background === true &&
+        data?.executed !== false &&
         typeof data?.id === "string"
       ) {
+        // executed:false means the call was denied before running — no
+        // shell will exist, so it must never contribute suppression.
         bgToolCalls.set(data.id, sessionID)
         logger.debug("Background shell tool call seen", { sessionID, callID: data.id })
       }

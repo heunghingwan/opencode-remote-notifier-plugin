@@ -93,7 +93,7 @@ Notification bodies carry event-specific content (the title's emoji identifies t
 - **error** shows the error message in a code block
 - **permission** shows the action and affected resources
 
-Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle).
+Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle). Tracked (no notification of their own): `session.created` / `renamed` / `deleted`, `session.tool.called` / `progress` / `success` / `failed`, `session.text.ended`, `shell.exited` / `shell.deleted` — the idle-suppression machinery below feeds on these.
 
 **Idle suppression** — an idle signal is treated as genuine idleness only after these checks pass:
 

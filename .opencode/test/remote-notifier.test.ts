@@ -737,6 +737,38 @@ describe("idle notifications (background shell waiting)", () => {
     // forever. The turn that finished after the wake is genuine idleness.
     expect(calls.length).toBe(1)
   })
+
+  test("a child-owned shell's exit cancels the ancestor's pending idle debounce", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(sessionCreated({ parentID: SESSION_ID }, "ses_child"))
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // schedules the parent's idle debounce
+    // The child's background shell registers inside the debounce window.
+    n.handleEvent(shellToolCalled("ses_child"))
+    n.handleEvent(shellToolProgress("shl_1", "ses_child"))
+    // The shell exits; the child wakes and the family keeps working. The
+    // parent's pending debounce must be cancelled, not fire in the gap
+    // between the exit and the child's execution.started.
+    n.handleEvent(shellExited("shl_1"))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("a tool call that never executed does not suppress idle", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(ev("session.tool.called", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", name: "shell", input: { command: "rm -rf /", background: true }, executed: false }))
+    n.handleEvent(shellToolProgress("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    // No shell was ever spawned (the call was denied before execution), so
+    // nothing will wake the session — this is genuine idleness.
+    expect(calls.length).toBe(1)
+  })
 })
 
 describe("idle notifications (session.status, future OpenCode versions)", () => {
