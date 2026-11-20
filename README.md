@@ -70,7 +70,7 @@ opencode plugin list
 | `error` | Session execution failures (LLM failures, API errors) | 5 (urgent) |
 | `permission` | Agent requests permission to access files | 4 (high) |
 | `question` | Agent asks the user a question | 4 (high) |
-| `idle` | Session becomes idle/waiting for input (suppressed while sub-agent children are still working — the parent's mid-handoff idle is not a real idle) | 3 (default) |
+| `idle` | Session becomes idle/waiting for input (suppressed while sub-agent children are still working, and while a background shell the session is waiting on is still pending) | 3 (default) |
 
 ### Rate Limiting
 
@@ -94,6 +94,15 @@ Notification bodies carry event-specific content (the title's emoji identifies t
 - **permission** shows the action and affected resources
 
 Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle).
+
+**Idle suppression** — an idle signal is treated as genuine idleness only after these checks pass:
+
+1. The session was busy first (no no-op idles), and the idle doesn't trail an error notification
+2. The session is not a sub-agent child, and no sub-agent child of it is still working
+3. **No background shell is pending**: when the agent starts a background shell and ends its turn, the shell's exit wakes it (a synthetic message resumes the session), so the waiting period is not idleness. The plugin tracks this via `session.tool.called` (`name: "shell"`, `input.background: true`) correlated with `session.tool.progress`/`success` (`metadata.shellID`), and releases it on `shell.exited` / `shell.deleted` / `session.deleted`
+   - Sessions waiting on a sub-agent's background shell are covered too (OpenCode's job semantics include background jobs owned by descendant sessions)
+   - A background shell that never exits (e.g. a dev server) suppresses idle indefinitely — the session is genuinely waiting for it to wake
+   - Not covered: a user manually moving a *foreground* shell to the background (the tool call's `background` input was false)
 
 ## Development
 

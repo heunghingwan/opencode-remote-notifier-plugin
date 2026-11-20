@@ -1,6 +1,6 @@
 {
   "name": "opencode-remote-notifier-plugin",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Push OpenCode events (errors, permission requests, questions, idle) to your phone via ntfy.sh",
   "keywords": [
     "opencode",
