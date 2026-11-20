@@ -313,14 +313,13 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
   switch (type) {
     case "error": {
       const errMsg = (payload?.error?.message ?? "unknown error").slice(0, 200)
-      const errType = typeof payload?.error?.type === "string" && payload.error.type ? payload.error.type : ""
       const project = payload?.project?.name ?? ""
       const prefix = project ? `**${project}**` : ""
       return {
         title,
         message: md
-          ? `${prefix}\n\n\u26a0\ufe0f **Error**${errType ? ` \u00b7 ${errType}` : ""}\n\n\`\`\`\n${errMsg}\n\`\`\``
-          : `[${project}] Error${errType ? ` (${errType})` : ""}: ${errMsg}`,
+          ? `${prefix}\n\n\`\`\`\n${errMsg}\n\`\`\``
+          : `[${project}] ${errMsg}`,
       }
     }
     case "permission": {
@@ -333,8 +332,8 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
       return {
         title,
         message: md
-          ? `${prefix}\n\n\ud83d\udd12 **Permission**\n\n\`${perm}\` on \`${patterns}\``
-          : `[${project}] Permission: ${perm} on ${patterns}`,
+          ? `${prefix}\n\n\`${perm}\` on \`${patterns}\``
+          : `[${project}] ${perm} on ${patterns}`,
       }
     }
     case "question": {
@@ -344,8 +343,8 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
       return {
         title,
         message: md
-          ? `${prefix}\n\n\u2753 **Question**\n\n> ${lines}${options ? `\n\n${options}` : ""}`
-          : `[${project}] Question: ${lines.replace(/\*\*/g, "")}${options ? ` (${options.replace(/`/g, "").replaceAll(" · ", ", ")})` : ""}`,
+          ? `${prefix}\n\n> ${lines}${options ? `\n\n${options}` : ""}`
+          : `[${project}] ${lines.replace(/\*\*/g, "")}${options ? ` (${options.replace(/`/g, "").replaceAll(" · ", ", ")})` : ""}`,
       }
     }
     case "idle": {
@@ -355,8 +354,8 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
       return {
         title,
         message: md
-          ? `${prefix}\n\n\ud83d\udca4 **Idle**\n\n${snippet ? `> ${snippet}` : "Session waiting for input"}`
-          : `[${project}] Idle — ${snippet || "session waiting for input"}`,
+          ? `${prefix}\n\n${snippet ? `> ${snippet}` : "Session waiting for input"}`
+          : `[${project}] ${snippet || "session waiting for input"}`,
       }
     }
   }

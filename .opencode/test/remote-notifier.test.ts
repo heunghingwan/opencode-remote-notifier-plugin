@@ -160,13 +160,13 @@ describe("error notifications", () => {
     expect(calls[0]!.tags).toEqual([])
   })
 
-  test("error body labels the error type next to the heading", () => {
+  test("error body shows only the error message", () => {
     const calls: SentCall[] = []
     const n = makeNotifier((p) => calls.push(p))
     n.handleEvent(sessionCreated())
     n.handleEvent(busy())
     n.handleEvent(executionFailed())
-    expect(calls[0]!.message).toBe("**alpha**\n\n⚠️ **Error** · provider.error\n\n```\nprovider rate limited\n```")
+    expect(calls[0]!.message).toBe("**alpha**\n\n```\nprovider rate limited\n```")
   })
 
   test("suppresses the trailing idle that follows an error", async () => {
@@ -245,7 +245,7 @@ describe("question notifications", () => {
     n.handleEvent(sessionCreated())
     n.handleEvent(formCreated())
     expect(calls[0]!.message).toBe(
-      "**alpha**\n\n❓ **Question**\n\n> **Database** — Which database should we use?\n\n`postgres` · `sqlite`",
+      "**alpha**\n\n> **Database** — Which database should we use?\n\n`postgres` · `sqlite`",
     )
   })
 
@@ -256,7 +256,7 @@ describe("question notifications", () => {
     n.handleEvent(ev("form.created", {
       form: { id: "form_2", sessionID: SESSION_ID, title: "Confirm deploy?", metadata: {}, fields: [] },
     }))
-    expect(calls[0]!.message).toBe("**alpha**\n\n❓ **Question**\n\n> Confirm deploy?")
+    expect(calls[0]!.message).toBe("**alpha**\n\n> Confirm deploy?")
   })
 
   test("form.created includes a renamed session title in the notification title", () => {
@@ -359,7 +359,7 @@ describe("idle notifications (V2 execution lifecycle)", () => {
     n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
     await sleep(50)
     expect(calls.length).toBe(1)
-    expect(calls[0]!.message).toBe("**alpha**\n\n💤 **Idle**\n\n> All 42 tests pass.")
+    expect(calls[0]!.message).toBe("**alpha**\n\n> All 42 tests pass.")
   })
 
   test("idle snippet is single-line and truncated with an ellipsis", async () => {
@@ -370,7 +370,6 @@ describe("idle notifications (V2 execution lifecycle)", () => {
     n.handleEvent(textEnded("   \n" + "x".repeat(300)))
     n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
     await sleep(50)
-    expect(calls[0]!.message).toContain("💤 **Idle**")
     const line = calls[0]!.message.split("\n").find((l: string) => l.startsWith("> "))!
     expect(line!.length).toBeLessThanOrEqual(142) // "> " + 140 chars max
     expect(line!.endsWith("…")).toBe(true)
@@ -390,7 +389,7 @@ describe("idle notifications (V2 execution lifecycle)", () => {
     n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
     await sleep(50)
     expect(calls.length).toBe(2)
-    expect(calls[1]!.message).toBe("**alpha**\n\n💤 **Idle**\n\nSession waiting for input")
+    expect(calls[1]!.message).toBe("**alpha**\n\nSession waiting for input")
   })
 })
 
@@ -790,30 +789,30 @@ describe("buildMessage", () => {
   test("error message embeds the error text in a code block", () => {
     const { title, message } = buildMessage(config, "error", withProject({ error: { type: "provider.error", message: "boom", status: 429 } }), "Fix login")
     expect(title).toBe("🚨 Fix login")
-    expect(message).toBe("**alpha**\n\n⚠️ **Error** · provider.error\n\n```\nboom\n```")
+    expect(message).toBe("**alpha**\n\n```\nboom\n```")
   })
 
   test("permission message shows action and resources", () => {
     const { message } = buildMessage(config, "permission", withProject({ action: "edit", resources: ["src/a.ts"] }))
-    expect(message).toBe("**alpha**\n\n🔒 **Permission**\n\n`edit` on `src/a.ts`")
+    expect(message).toBe("**alpha**\n\n`edit` on `src/a.ts`")
   })
 
   test("question message quotes the form title", () => {
     const { message } = buildMessage(config, "question", withProject({ form: { id: "f", sessionID: "s", title: "Which database?", fields: [] } }))
-    expect(message).toBe("**alpha**\n\n❓ **Question**\n\n> Which database?")
+    expect(message).toBe("**alpha**\n\n> Which database?")
   })
 
   test("idle message in plain text mode", () => {
     const plain = { ...config, markdown: false }
     const { title, message } = buildMessage(plain, "idle", withProject({}), "New session - 2026-10-01T10:00:00")
     expect(title).toBe("💤 Idle")
-    expect(message).toBe("[alpha] Idle — session waiting for input")
+    expect(message).toBe("[alpha] session waiting for input")
   })
 
   test("idle message quotes the last assistant text in plain text mode", () => {
     const plain = { ...config, markdown: false }
     const { message } = buildMessage(plain, "idle", withProject({ lastText: "Done in 3m." }))
-    expect(message).toBe("[alpha] Idle — Done in 3m.")
+    expect(message).toBe("[alpha] Done in 3m.")
   })
 
   test("question message renders each field as its own quoted line", () => {
@@ -828,7 +827,7 @@ describe("buildMessage", () => {
         ],
       },
     }))
-    expect(message).toBe("**alpha**\n\n❓ **Question**\n\n> **Region** — Where to deploy?\n> Enable cache?\n\n`eu`")
+    expect(message).toBe("**alpha**\n\n> **Region** — Where to deploy?\n> Enable cache?\n\n`eu`")
   })
 
   test("question message in plain text mode", () => {
@@ -841,7 +840,7 @@ describe("buildMessage", () => {
         fields: [{ key: "q0", title: "DB", description: "Which one?", options: [{ value: "a", label: "a" }, { value: "b", label: "b" }] }],
       },
     }))
-    expect(message).toBe("[alpha] Question: DB — Which one? (a, b)")
+    expect(message).toBe("[alpha] DB — Which one? (a, b)")
   })
 })
 
