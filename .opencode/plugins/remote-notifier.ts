@@ -227,6 +227,8 @@ async function sendNotification(payload: NotifyPayload, logger: Logger): Promise
 interface SessionInfo {
   parentID?: string
   title?: string
+  /** Set once a session-API metadata fetch has been attempted (or run) — one per session. */
+  metaChecked?: boolean
   /**
    * Directory of the location this session belongs to (from session.created's
    * data.location, an event envelope location, or the session API). Used to
@@ -383,7 +385,7 @@ export interface NotifierDeps {
    * sessions of unknown directory are treated as local (legacy
    * single-instance behavior) and unknown titles fall back to the event label.
    */
-  resolveSession?: (sessionID: string) => Promise<{ directory: string | null; title?: string | null } | null>
+  resolveSession?: (sessionID: string) => Promise<{ directory: string | null; title?: string | null; parentID?: string | null } | null>
 }
 
 export function createNotifier(config: Config, logger: Logger, projectDir: string, deps: NotifierDeps = {}) {
@@ -486,15 +488,17 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     return false
   }
 
-  // Backfills the session's title (and directory, when unknown) from the
-  // session API. session.renamed fires exactly once per session — if this
-  // instance subscribed after that (server restart, plugin reload, late
-  // location activation), the API is the only way to ever learn the title.
-  // Dedups in-flight per session; a session.renamed arriving during a fetch
-  // always wins (the merge only fills unknown titles).
+  // Backfills session metadata (directory, title, parentID) from the session
+  // API, once per session. Needed when this instance missed the events that
+  // carry them: session.created/renamed (server restart, plugin reload, late
+  // location activation). parentID matters even when the envelope location
+  // seeds the directory synchronously — without the family link, idle
+  // suppression for sub-agent trees and background shells breaks after a
+  // reload. Dedups in-flight per session; event data arriving during a fetch
+  // always wins (the merge only fills unknown fields).
   function ensureTitle(sessionID: string): Promise<void> {
     const info = sessions.get(sessionID)
-    if (!info || info.title !== undefined || !resolveSession) return Promise.resolve()
+    if (!info || info.metaChecked || !resolveSession) return Promise.resolve()
     let fetch = sessionFetches.get(sessionID)
     if (!fetch) {
       fetch = (async () => {
@@ -509,9 +513,17 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
             fresh.title = fetched.title
             logger.debug("Session title backfilled", { sessionID })
           }
+          if (fresh.parentID === undefined && fetched.parentID) {
+            fresh.parentID = fetched.parentID
+            logger.debug("Session parentID backfilled", { sessionID, parentID: fetched.parentID })
+          }
         } catch (err) {
-          logger.debug("Session title resolution failed", { sessionID, error: String(err) })
+          logger.debug("Session metadata resolution failed", { sessionID, error: String(err) })
         } finally {
+          // One attempt per session: a second fetch could only return what
+          // the first already applied (or couldn't find).
+          const fresh = sessions.get(sessionID)
+          if (fresh) fresh.metaChecked = true
           sessionFetches.delete(sessionID)
         }
       })()
@@ -776,7 +788,15 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     // Only the instance whose directory owns the session may act on it;
     // otherwise N locations would emit N duplicate notifications.
     if (!sessionID) return
-    if (!sessions.has(sessionID)) sessions.set(sessionID, {})
+    if (!sessions.has(sessionID)) {
+      sessions.set(sessionID, {})
+      // First sight of this session (session.created was missed — server
+      // restart, plugin reload). Fire a background metadata fetch so its
+      // parentID is learned even when the envelope location seeds the
+      // directory synchronously; without the family link, idle suppression
+      // for sub-agent trees and background shells breaks after a reload.
+      void ensureTitle(sessionID)
+    }
 
     // Seed the session's directory from the envelope location (authoritative
     // for events published by the session's own location services).
@@ -798,27 +818,17 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       const run = async () => {
         const info = sessions.get(sessionID)
         if (!info) return
-        let resolved = info.directory
-        let fetched: Awaited<ReturnType<NonNullable<typeof resolveSession>>> = null
-        if (resolved === undefined) {
-          try {
-            fetched = await resolveSession(sessionID)
-            resolved = fetched?.directory ?? null
-          } catch (err) {
-            logger.debug("Session directory resolution failed", { sessionID, error: String(err) })
-            resolved = null
-          }
-          const fresh = sessions.get(sessionID)
-          if (fresh) {
-            fresh.directory = resolved
-            // The same lookup can fill a never-learned title (missed rename).
-            if (fetched?.title && fresh.title == null && !isDefaultTitle(fetched.title)) {
-              fresh.title = fetched.title
-            }
-          }
+        if (info.directory === undefined) {
+          // Shares the in-flight metadata fetch with ensureTitle (deduped)
+          // — one session.get backfills directory, title and parentID.
+          await ensureTitle(sessionID)
         }
-        if (resolved !== projectDir) {
-          logger.debug("Foreign session — skipping", { sessionID, sessionDir: resolved })
+        const fresh = sessions.get(sessionID)
+        if (!fresh) return
+        // Cache a definitive null so foreign sessions never re-fetch.
+        if (fresh.directory === undefined) fresh.directory = null
+        if (fresh.directory !== projectDir) {
+          logger.debug("Foreign session — skipping", { sessionID, sessionDir: fresh.directory })
           return
         }
         processSessionEvent(type, data, sessionID, eventDir)
@@ -1070,7 +1080,11 @@ export default Plugin.define({
       resolveSession: async (sessionID) => {
         try {
           const info = await ctx.session.get({ sessionID })
-          return { directory: info?.location?.directory ?? null, title: info?.title ?? null }
+          return {
+            directory: info?.location?.directory ?? null,
+            title: info?.title ?? null,
+            parentID: info?.parentID ?? null,
+          }
         } catch {
           return null
         }

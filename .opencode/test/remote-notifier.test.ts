@@ -769,6 +769,28 @@ describe("idle notifications (background shell waiting)", () => {
     // nothing will wake the session — this is genuine idleness.
     expect(calls.length).toBe(1)
   })
+
+  test("a child's parentID is backfilled from the session API after a reload", async () => {
+    const calls: SentCall[] = []
+    // Reload scenario: session.created for the child was never seen, so its
+    // parentID is unknown; its events carry the location (directory seeds
+    // synchronously, no directory fetch would ever run). The session API is
+    // the only way to learn the family link.
+    const n = makeNotifier((p) => calls.push(p), PLUGIN_DIR, {
+      resolveSession: async (sessionID) =>
+        sessionID === "ses_child"
+          ? { directory: PLUGIN_DIR, parentID: SESSION_ID }
+          : { directory: PLUGIN_DIR },
+    })
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: "ses_child" })) // first sight of the child
+    n.handleEvent(shellToolCalled("ses_child"))
+    n.handleEvent(shellToolProgress("shl_1", "ses_child"))
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // parent idle signal — child fetch still in flight
+    await sleep(50) // fetch lands; the fire-time re-check sees the family link
+    expect(calls.length).toBe(0)
+  })
 })
 
 describe("idle notifications (session.status, future OpenCode versions)", () => {
