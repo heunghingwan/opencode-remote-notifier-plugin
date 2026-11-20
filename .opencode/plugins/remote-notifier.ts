@@ -1046,7 +1046,90 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     errored.clear()
   }
 
-  return { handleEvent, cleanup }
+  // Stream-gap reset (the event subscription dropped and reconnected):
+  // events during the gap were missed, so transient tracking is stale — a
+  // busy session may have gone idle, a background shell may have exited.
+  // Clearing trades at most one missed/spurious notification for never
+  // wedging on dead state. Durable knowledge (the sessions map: titles,
+  // directories, family links) survives — those are facts, not snapshots.
+  function reset(): void {
+    for (const timer of idleDebounce.values()) clearTimeout(timer)
+    for (const timer of permissionDebounce.values()) clearTimeout(timer)
+    idleDebounce.clear()
+    permissionDebounce.clear()
+    lastText.clear()
+    bgToolCalls.clear()
+    backgroundShells.clear()
+    recentShellExits.clear()
+    active.clear()
+    errored.clear()
+  }
+
+  return { handleEvent, cleanup, reset }
+}
+
+// ---- Subscription with reconnect ----
+// The event stream can drop (bus error, server-side stream end). Without a
+// retry the plugin goes permanently deaf after the first drop. With a blind
+// retry, state learned before the gap goes stale — events missed during the
+// gap could wedge suppression forever (e.g. a background shell that exited
+// unseen). onGap fires at every drop so the caller can reset transient
+// state before resubscribing.
+
+const RESUBSCRIBE_BASE_MS = 1000
+const RESUBSCRIBE_MAX_MS = 30000
+
+function abortableSleep(signal: AbortSignal, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+export interface SubscribeRetryOptions {
+  subscribe: (signal: AbortSignal) => AsyncIterable<any>
+  onEvent: (event: any) => void
+  /** Called after each stream drop (error or graceful end), before the resubscribe backoff. */
+  onGap?: () => void
+  signal: AbortSignal
+  logger: Logger
+  baseDelayMs?: number
+  maxDelayMs?: number
+}
+
+export async function subscribeWithRetry(opts: SubscribeRetryOptions): Promise<void> {
+  const { subscribe, onEvent, onGap, signal, logger } = opts
+  const base = opts.baseDelayMs ?? RESUBSCRIBE_BASE_MS
+  const max = opts.maxDelayMs ?? RESUBSCRIBE_MAX_MS
+  let attempt = 0
+  while (!signal.aborted) {
+    try {
+      for await (const event of subscribe(signal)) {
+        if (attempt !== 0) attempt = 0 // first delivered event: stream is healthy
+        onEvent(event)
+      }
+      if (signal.aborted) return
+      logger.warn("Event stream ended — reconnecting")
+    } catch (err) {
+      if (signal.aborted) return
+      logger.error("Event stream failed — reconnecting", { error: String(err) })
+    }
+    onGap?.()
+    const delay = Math.min(base * 2 ** Math.min(attempt, 30), max)
+    attempt++
+    await abortableSleep(signal, delay)
+  }
 }
 
 // ---- Plugin Export ----
@@ -1092,17 +1175,13 @@ export default Plugin.define({
     })
     const controller = new AbortController()
 
-    void (async () => {
-      try {
-        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          notifier.handleEvent(event)
-        }
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          logger.error("Event subscription failed", { error: String(err) })
-        }
-      }
-    })()
+    void subscribeWithRetry({
+      subscribe: (signal) => ctx.event.subscribe({ signal }),
+      onEvent: (event) => notifier.handleEvent(event),
+      onGap: () => notifier.reset(),
+      signal: controller.signal,
+      logger,
+    })
 
     return () => {
       controller.abort()

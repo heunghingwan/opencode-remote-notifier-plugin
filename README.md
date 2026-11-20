@@ -79,7 +79,7 @@ opencode plugin list
 
 ## How It Works
 
-The plugin subscribes to OpenCode's V2 server event stream (`ctx.event.subscribe`) and forwards relevant events as ntfy.sh push notifications:
+The plugin subscribes to OpenCode's V2 server event stream (`ctx.event.subscribe`) and forwards relevant events as ntfy.sh push notifications. If the stream drops (bus error, stream end), it reconnects with exponential backoff (1s→30s) and resets transient tracking state — events missed during the gap could otherwise wedge suppression; session knowledge (titles, directories, family links) survives the gap:
 
 1. `session.created` events are intercepted to cache the session's title and parent (sub-agent sessions are silenced)
 2. `session.renamed` events update the cached title; when a notification fires, the real title is included

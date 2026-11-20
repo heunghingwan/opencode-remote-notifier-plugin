@@ -6,7 +6,7 @@ import { describe, test, expect } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import pluginDefault, { buildMessage, createNotifier, RateLimiter, readConfig } from "../plugins/remote-notifier.ts"
+import pluginDefault, { buildMessage, createNotifier, RateLimiter, readConfig, subscribeWithRetry } from "../plugins/remote-notifier.ts"
 import type { Config, NotifierDeps } from "../plugins/remote-notifier.ts"
 
 // ---- Fixtures ----
@@ -141,6 +141,124 @@ describe("plugin entry", () => {
   test("default export is a Plugin.define definition with id and setup", () => {
     expect(pluginDefault.id).toBe("remote-notifier")
     expect(typeof pluginDefault.setup).toBe("function")
+  })
+})
+
+describe("subscription retry (stream-gap hardening)", () => {
+  // The event stream can drop (bus error, server-side stream end). Without a
+  // retry the plugin goes permanently deaf; without a gap reset, state from
+  // before the gap (suppression tracking, pending debounces) goes stale.
+  const silence = () => new Promise<never>(() => {})
+  const logger = { ...silentLogger }
+
+  test("reconnects after the stream throws and reports the gap", async () => {
+    const events: string[] = []
+    let gaps = 0
+    let calls = 0
+    const streams = [
+      async function* () {
+        yield "a"
+        throw new Error("bus reset")
+      },
+      async function* () {
+        yield "b"
+        await silence()
+      },
+    ]
+    const controller = new AbortController()
+    void subscribeWithRetry({
+      subscribe: () => streams[calls++]!(),
+      onEvent: (e) => events.push(e),
+      onGap: () => gaps++,
+      signal: controller.signal,
+      logger,
+      baseDelayMs: 5,
+      maxDelayMs: 10,
+    })
+    await sleep(60)
+    expect(events).toEqual(["a", "b"])
+    expect(gaps).toBe(1)
+    expect(calls).toBe(2)
+    controller.abort()
+  })
+
+  test("reconnects after the stream ends without an error", async () => {
+    const events: string[] = []
+    let calls = 0
+    const streams = [
+      async function* () {
+        yield "a"
+      },
+      async function* () {
+        yield "b"
+        await silence()
+      },
+    ]
+    const controller = new AbortController()
+    void subscribeWithRetry({
+      subscribe: () => streams[calls++]!(),
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+      logger,
+      baseDelayMs: 5,
+      maxDelayMs: 10,
+    })
+    await sleep(60)
+    expect(events).toEqual(["a", "b"])
+    expect(calls).toBe(2)
+    controller.abort()
+  })
+
+  test("eventually connects across repeated failures", async () => {
+    const events: string[] = []
+    let calls = 0
+    const healthy = async function* () {
+      yield "ok"
+      await silence()
+    }
+    const controller = new AbortController()
+    void subscribeWithRetry({
+      subscribe: () => {
+        calls++
+        if (calls <= 3) {
+          return (async function* () {
+            throw new Error("down")
+          })()
+        }
+        return healthy()
+      },
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+      logger,
+      baseDelayMs: 2,
+      maxDelayMs: 8,
+    })
+    await sleep(80)
+    expect(events).toEqual(["ok"])
+    expect(calls).toBe(4)
+    controller.abort()
+  })
+
+  test("does not reconnect once aborted, and the backoff sleep wakes early", async () => {
+    let calls = 0
+    const controller = new AbortController()
+    const started = Date.now()
+    const done = subscribeWithRetry({
+      subscribe: () => {
+        calls++
+        throw new Error("down")
+      },
+      onEvent: () => {},
+      signal: controller.signal,
+      logger,
+      baseDelayMs: 5000,
+      maxDelayMs: 5000,
+    })
+    await sleep(30) // first failure happened; loop is sleeping 5s
+    controller.abort()
+    await done // abortable sleep must resolve immediately, not after 5s
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(calls).toBe(1)
   })
 })
 
@@ -790,6 +908,27 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(execSucceeded(SESSION_ID)) // parent idle signal — child fetch still in flight
     await sleep(50) // fetch lands; the fire-time re-check sees the family link
     expect(calls.length).toBe(0)
+  })
+
+  test("reset (stream gap) clears pending suppression but keeps session knowledge", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.renamed", { sessionID: SESSION_ID, title: "Fix login bug" }))
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(shellToolCalled())
+    n.handleEvent(shellToolProgress("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(40)
+    expect(calls.length).toBe(0) // suppressed while the shell is pending
+    n.reset() // stream dropped — events during the gap were missed
+    // Stale background-shell tracking is gone; a fresh turn's idle notifies,
+    // still with the session's title (the sessions map survives the gap).
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("💤 Fix login bug")
   })
 })
 
