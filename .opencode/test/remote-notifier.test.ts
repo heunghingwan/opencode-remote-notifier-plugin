@@ -630,6 +630,84 @@ describe("idle notifications (background shell waiting)", () => {
     await sleep(50)
     expect(calls.length).toBe(0)
   })
+
+  test("shell.exited cancels the pending idle debounce of the owning session", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(shellToolCalled())
+    n.handleEvent(shellToolProgress("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
+    n.handleEvent(shellExited("shl_1")) // wake is imminent — no execution.started follows here
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("idle notifies after the shell exits and the woken turn finishes", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(shellToolCalled())
+    n.handleEvent(shellToolProgress("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID)) // suppressed wait
+    n.handleEvent(shellExited("shl_1"))
+    n.handleEvent(execStarted(SESSION_ID)) // synthetic wake
+    n.handleEvent(execSucceeded(SESSION_ID)) // genuine idle
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("💤 Idle")
+  })
+
+  test("shell.deleted removes the pending shell so idle notifies again", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(shellToolCalled())
+    n.handleEvent(shellToolProgress("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(0) // suppressed while shl_1 pending
+    n.handleEvent(shellDeleted("shl_1"))
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+  })
+
+  test("duplicate shell.exited is ignored", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(shellToolCalled())
+    n.handleEvent(shellToolProgress("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    n.handleEvent(shellExited("shl_1"))
+    n.handleEvent(shellExited("shl_1")) // late duplicate must be a no-op
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("session.deleted releases a child's background shell so the parent can notify idle", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(sessionCreated({ parentID: SESSION_ID }, "ses_child"))
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(shellToolCalled("ses_child"))
+    n.handleEvent(shellToolProgress("shl_1", "ses_child"))
+    n.handleEvent(execSucceeded(SESSION_ID)) // suppressed by the child's shell
+    await sleep(50)
+    expect(calls.length).toBe(0)
+    n.handleEvent(ev("session.deleted", { sessionID: "ses_child" }))
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+  })
 })
 
 describe("idle notifications (session.status, future OpenCode versions)", () => {

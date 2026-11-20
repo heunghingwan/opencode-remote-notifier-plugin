@@ -692,6 +692,27 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       return
     }
 
+    // ---- shell.exited / shell.deleted: release background-shell tracking ----
+    // These events carry no sessionID (just {id}), so they must run before the
+    // ownership gate below — ownership was already established when the shell
+    // was registered from this instance's tool events.
+    if (type === "shell.exited" || type === "shell.deleted") {
+      const shellID = data?.id
+      if (typeof shellID === "string") {
+        const owner = backgroundShells.get(shellID)
+        if (owner) {
+          backgroundShells.delete(shellID)
+          // An exited shell wakes its session (synthetic message with
+          // resume) within milliseconds — cancel the debounce rather than
+          // race it. A deleted (killed) running shell wakes the same way
+          // with a "Cancelled" notice. Duplicate events are no-ops.
+          cancelIdleDebounce(owner)
+          logger.debug("Background shell released", { shellID, sessionID: owner, via: type })
+        }
+      }
+      return
+    }
+
     // ---- session.deleted: release all tracking state for this session ----
     if (type === "session.deleted") {
       if (data?.sessionID) {
@@ -702,6 +723,14 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         active.delete(data.sessionID)
         errored.delete(data.sessionID)
         lastText.delete(data.sessionID)
+        // A deleted session's background shells can never wake it — drop
+        // them so they cannot hold this (or an ancestor's) idle hostage.
+        for (const [shellID, owner] of backgroundShells) {
+          if (owner === data.sessionID) backgroundShells.delete(shellID)
+        }
+        for (const [callID, owner] of bgToolCalls) {
+          if (owner === data.sessionID) bgToolCalls.delete(callID)
+        }
         cancelIdleDebounce(data.sessionID)
         if (parentID) cancelIdleDebounce(parentID)
         cancelPermissionDebounce(data.sessionID)
@@ -954,6 +983,8 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     pending.clear()
     sessionFetches.clear()
     lastText.clear()
+    bgToolCalls.clear()
+    backgroundShells.clear()
     sessions.clear()
     active.clear()
     errored.clear()
