@@ -95,11 +95,26 @@ const formCreated = (sessionID = SESSION_ID) =>
     form: {
       id: "form_1",
       sessionID,
-      title: "Which database?",
+      // Real V2 question-tool shape: title is the constant "Questions";
+      // the content lives in fields[] (title = header, description = text).
+      title: "Questions",
       metadata: {},
-      fields: [{ id: "f1", label: "DB", options: ["postgres", "sqlite"] }],
+      fields: [{
+        key: "q0",
+        title: "Database",
+        description: "Which database should we use?",
+        type: "string",
+        custom: true,
+        options: [
+          { value: "postgres", label: "postgres" },
+          { value: "sqlite", label: "sqlite" },
+        ],
+      }],
     },
   })
+
+const textEnded = (text: string, sessionID = SESSION_ID) =>
+  ev("session.text.ended", { sessionID, assistantMessageID: "msg_1", ordinal: 0, text })
 
 interface SentCall {
   title: string
@@ -143,6 +158,15 @@ describe("error notifications", () => {
     expect(calls[0]!.message).toContain("provider rate limited")
     expect(calls[0]!.priority).toBe(5)
     expect(calls[0]!.tags).toEqual([])
+  })
+
+  test("error body labels the error type next to the heading", () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(busy())
+    n.handleEvent(executionFailed())
+    expect(calls[0]!.message).toBe("**alpha**\n\n⚠️ **Error** · provider.error\n\n```\nprovider rate limited\n```")
   })
 
   test("suppresses the trailing idle that follows an error", async () => {
@@ -211,8 +235,28 @@ describe("question notifications", () => {
     n.handleEvent(formCreated())
     expect(calls.length).toBe(1)
     expect(calls[0]!.title).toBe("❓ Question")
-    expect(calls[0]!.message).toContain("Which database?")
+    expect(calls[0]!.message).toContain("Which database should we use?")
     expect(calls[0]!.priority).toBe(4)
+  })
+
+  test("question body uses the field header, question text and options", () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(formCreated())
+    expect(calls[0]!.message).toBe(
+      "**alpha**\n\n❓ **Question**\n\n> **Database** — Which database should we use?\n\n`postgres` · `sqlite`",
+    )
+  })
+
+  test("question body falls back to the form title when there are no fields", () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("form.created", {
+      form: { id: "form_2", sessionID: SESSION_ID, title: "Confirm deploy?", metadata: {}, fields: [] },
+    }))
+    expect(calls[0]!.message).toBe("**alpha**\n\n❓ **Question**\n\n> Confirm deploy?")
   })
 
   test("form.created includes a renamed session title in the notification title", () => {
@@ -304,6 +348,49 @@ describe("idle notifications (V2 execution lifecycle)", () => {
     await sleep(50)
     expect(calls.length).toBe(1)
     expect(calls[0]!.title).toBe("💤 Fix login bug")
+  })
+
+  test("idle body quotes the last assistant message of the finished turn", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(textEnded("All 42 tests pass.\n\nDetails in the log."))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.message).toBe("**alpha**\n\n💤 **Idle**\n\n> All 42 tests pass.")
+  })
+
+  test("idle snippet is single-line and truncated with an ellipsis", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(textEnded("   \n" + "x".repeat(300)))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls[0]!.message).toContain("💤 **Idle**")
+    const line = calls[0]!.message.split("\n").find((l: string) => l.startsWith("> "))!
+    expect(line!.length).toBeLessThanOrEqual(142) // "> " + 140 chars max
+    expect(line!.endsWith("…")).toBe(true)
+  })
+
+  test("a snippet from an earlier turn is cleared when a new execution starts", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(textEnded("Old turn result."))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls[0]!.message).toContain("> Old turn result.")
+    // Next turn produces no text (e.g. tool-only) — the stale snippet must not reappear.
+    n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }))
+    n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }))
+    await sleep(50)
+    expect(calls.length).toBe(2)
+    expect(calls[1]!.message).toBe("**alpha**\n\n💤 **Idle**\n\nSession waiting for input")
   })
 })
 
@@ -703,7 +790,7 @@ describe("buildMessage", () => {
   test("error message embeds the error text in a code block", () => {
     const { title, message } = buildMessage(config, "error", withProject({ error: { type: "provider.error", message: "boom", status: 429 } }), "Fix login")
     expect(title).toBe("🚨 Fix login")
-    expect(message).toBe("**alpha**\n\n⚠️ **Error**\n\n```\nboom\n```")
+    expect(message).toBe("**alpha**\n\n⚠️ **Error** · provider.error\n\n```\nboom\n```")
   })
 
   test("permission message shows action and resources", () => {
@@ -721,6 +808,40 @@ describe("buildMessage", () => {
     const { title, message } = buildMessage(plain, "idle", withProject({}), "New session - 2026-10-01T10:00:00")
     expect(title).toBe("💤 Idle")
     expect(message).toBe("[alpha] Idle — session waiting for input")
+  })
+
+  test("idle message quotes the last assistant text in plain text mode", () => {
+    const plain = { ...config, markdown: false }
+    const { message } = buildMessage(plain, "idle", withProject({ lastText: "Done in 3m." }))
+    expect(message).toBe("[alpha] Idle — Done in 3m.")
+  })
+
+  test("question message renders each field as its own quoted line", () => {
+    const { message } = buildMessage(config, "question", withProject({
+      form: {
+        id: "f",
+        sessionID: "s",
+        title: "Questions",
+        fields: [
+          { key: "q0", title: "Region", description: "Where to deploy?", options: [{ value: "eu", label: "eu" }] },
+          { key: "q1", description: "Enable cache?", options: [] },
+        ],
+      },
+    }))
+    expect(message).toBe("**alpha**\n\n❓ **Question**\n\n> **Region** — Where to deploy?\n> Enable cache?\n\n`eu`")
+  })
+
+  test("question message in plain text mode", () => {
+    const plain = { ...config, markdown: false }
+    const { message } = buildMessage(plain, "question", withProject({
+      form: {
+        id: "f",
+        sessionID: "s",
+        title: "Questions",
+        fields: [{ key: "q0", title: "DB", description: "Which one?", options: [{ value: "a", label: "a" }, { value: "b", label: "b" }] }],
+      },
+    }))
+    expect(message).toBe("[alpha] Question: DB — Which one? (a, b)")
   })
 })
 

@@ -86,6 +86,13 @@ The plugin subscribes to OpenCode's V2 server event stream (`ctx.event.subscribe
 3. If the title is still the auto-generated default (`New session - ...`) or unknown, the title falls back to the short event label (e.g. `💤 Idle`)
 4. `session.renamed` fires exactly once per session — if the instance subscribed after that (server restart, plugin reload, late location activation), the title is fetched via `ctx.session.get` right before notifying, so it is never silently blank
 
+Notification bodies carry event-specific content:
+
+- **idle** quotes the first line (≤140 chars) of the turn's last assistant message, tracked from `session.text.ended` and cleared when a new execution starts — falls back to "Session waiting for input"
+- **question** renders the form's fields (header, question text, choice labels) — the question tool's form title is the constant "Questions", so the fields are where the real question lives
+- **error** labels the error type (e.g. `provider.error`) above the error message
+- **permission** shows the action and affected resources
+
 Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle).
 
 ## Development

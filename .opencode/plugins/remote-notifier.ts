@@ -258,11 +258,52 @@ function isDefaultTitle(title: string): boolean {
   return /^(New|Child) session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(title)
 }
 
+// First meaningful line of a text block, collapsed and length-capped for
+// notification previews (phone notification bars show little).
+const SNIPPET_MAX = 140
+
+function firstLineSnippet(text: unknown): string {
+  if (typeof text !== "string") return ""
+  const line = text
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0)
+  if (!line) return ""
+  return line.length > SNIPPET_MAX ? `${line.slice(0, SNIPPET_MAX - 1).trimEnd()}…` : line
+}
+
+// Question forms from the question tool carry the constant title "Questions";
+// the real content is the fields: title (header), description (question text),
+// options (choices). Other form sources may only have a real title.
+function questionLines(form: any): { lines: string; options: string } {
+  const fields: any[] = Array.isArray(form?.fields) ? form.fields : []
+  const lines = fields
+    .map((f) => {
+      const header = typeof f?.title === "string" ? f.title.trim() : ""
+      const text = firstLineSnippet(f?.description)
+      if (header && text) return `**${header}** — ${text}`
+      return header || text
+    })
+    .filter(Boolean)
+  const options = fields
+    .flatMap((f) => (Array.isArray(f?.options) ? f.options : []))
+    .map((o) => (typeof o?.label === "string" ? o.label : ""))
+    .filter(Boolean)
+    .slice(0, 6)
+    .map((label) => `\`${label}\``)
+    .join(" · ")
+  if (lines.length > 0) return { lines: lines.join("\n> "), options }
+  const title = firstLineSnippet(form?.title)
+  return { lines: title || "user input needed", options }
+}
+
 // V2 payload shapes (see @opencode/plugin 2.x event schemas):
 //   error      session.execution.failed  data.{sessionID, error.message}
 //   permission permission.asked          data.{sessionID, action, resources}
 //   question   form.created              data.form.{sessionID, title}
 //   idle       session.status            data.{sessionID, status.type}
+// dispatch() injects project.name (directory basename) and lastText (the
+// finished turn's last assistant text, tracked from session.text.ended).
 export function buildMessage(config: Config, type: EventType, payload: any, sessionTitle?: string | null): { title: string; message: string } {
   const emoji = EVENT_EMOJI[type]
   const effectiveTitle = sessionTitle && !isDefaultTitle(sessionTitle) ? sessionTitle : EVENT_LABELS[type]
@@ -272,13 +313,14 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
   switch (type) {
     case "error": {
       const errMsg = (payload?.error?.message ?? "unknown error").slice(0, 200)
+      const errType = typeof payload?.error?.type === "string" && payload.error.type ? payload.error.type : ""
       const project = payload?.project?.name ?? ""
       const prefix = project ? `**${project}**` : ""
       return {
         title,
         message: md
-          ? `${prefix}\n\n\u26a0\ufe0f **Error**\n\n\`\`\`\n${errMsg}\n\`\`\``
-          : `[${project}] Error: ${errMsg}`,
+          ? `${prefix}\n\n\u26a0\ufe0f **Error**${errType ? ` \u00b7 ${errType}` : ""}\n\n\`\`\`\n${errMsg}\n\`\`\``
+          : `[${project}] Error${errType ? ` (${errType})` : ""}: ${errMsg}`,
       }
     }
     case "permission": {
@@ -296,24 +338,25 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
       }
     }
     case "question": {
-      const text = (payload?.form?.title ?? "user input needed").slice(0, 80)
+      const { lines, options } = questionLines(payload?.form)
       const project = payload?.project?.name ?? ""
       const prefix = project ? `**${project}**` : ""
       return {
         title,
         message: md
-          ? `${prefix}\n\n\u2753 **Question**\n\n> ${text}`
-          : `[${project}] Question: ${text}`,
+          ? `${prefix}\n\n\u2753 **Question**\n\n> ${lines}${options ? `\n\n${options}` : ""}`
+          : `[${project}] Question: ${lines.replace(/\*\*/g, "")}${options ? ` (${options.replace(/`/g, "").replaceAll(" · ", ", ")})` : ""}`,
       }
     }
     case "idle": {
+      const snippet = firstLineSnippet(payload?.lastText)
       const project = payload?.project?.name ?? ""
       const prefix = project ? `**${project}**` : ""
       return {
         title,
         message: md
-          ? `${prefix}\n\n\ud83d\udca4 **Idle**\n\nSession waiting for input`
-          : `[${project}] Idle — session waiting for input`,
+          ? `${prefix}\n\n\ud83d\udca4 **Idle**\n\n${snippet ? `> ${snippet}` : "Session waiting for input"}`
+          : `[${project}] Idle — ${snippet || "session waiting for input"}`,
       }
     }
   }
@@ -363,6 +406,10 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   const pending = new Map<string, Promise<void>>()
   // In-flight session API lookups backing ensureTitle, deduped per session.
   const sessionFetches = new Map<string, Promise<void>>()
+  // Last assistant text of the turn in flight, per session (from
+  // session.text.ended). Cleared when a new execution starts so idle
+  // notifications preview only the turn that just finished.
+  const lastText = new Map<string, string>()
 
   function cancelIdleDebounce(sessionID: string): void {
     const timer = idleDebounce.get(sessionID)
@@ -464,7 +511,10 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     // directory is only the fallback for events without a location.
     const sessionDir = sessionID ? sessions.get(sessionID)?.directory ?? null : null
     const project = path.basename(sessionDir ?? eventDir ?? projectDir)
-    const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project } }, sessionTitle)
+    const extra = eventType === "idle" && sessionID
+      ? { lastText: lastText.get(sessionID) }
+      : {}
+    const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project }, ...extra }, sessionTitle)
 
     logger.info("Sending notification", { type: eventType, title, priority: config.events[eventType].priority })
 
@@ -541,6 +591,8 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     active.add(sessionID)
     errored.delete(sessionID)
     cancelIdleDebounce(sessionID)
+    // A new turn started: the previous turn's text preview is stale.
+    lastText.delete(sessionID)
     // A child going busy means the parent's pending idle signal was a
     // sub-agent handoff, not genuine idleness — cancel the parent's idle
     // notification. Covers the race where the child's execution starts after
@@ -602,6 +654,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         sessions.delete(data.sessionID)
         active.delete(data.sessionID)
         errored.delete(data.sessionID)
+        lastText.delete(data.sessionID)
         cancelIdleDebounce(data.sessionID)
         if (parentID) cancelIdleDebounce(parentID)
         cancelPermissionDebounce(data.sessionID)
@@ -684,6 +737,16 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     sessionID: string | undefined,
     eventDir: string | null,
   ): void {
+    // ---- Last assistant text: idle notifications preview the finished turn ----
+    // session.text.ended carries the final text of each assistant part; the
+    // last one before the idle signal is the turn's closing message.
+    if (type === "session.text.ended") {
+      if (sessionID && typeof data?.text === "string" && data.text.trim()) {
+        lastText.set(sessionID, data.text.slice(0, 400))
+      }
+      return
+    }
+
     // ---- Execution lifecycle: the real busy/idle signal on OpenCode ≤2.0.21 ----
     // session.status/session.idle exist in the schema but have no emitter in
     // 2.0.21 (marked deprecated); emitters were only added after 2.0.21. Drive
@@ -795,6 +858,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     permissionDebounce.clear()
     pending.clear()
     sessionFetches.clear()
+    lastText.clear()
     sessions.clear()
     active.clear()
     errored.clear()
