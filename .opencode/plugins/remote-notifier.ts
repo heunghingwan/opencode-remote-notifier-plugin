@@ -76,6 +76,10 @@ const DEFAULTS: Config = {
 const IDLE_DEBOUNCE_MS = 5000
 const PERMISSION_DEBOUNCE_MS = 5000
 
+// Cap for remembered exits of never-registered shells (see recentShellExits
+// in createNotifier). Defensive bound only — shell ids are unique.
+const RECENT_SHELL_EXIT_CAP = 64
+
 // ---- Config Reader ----
 
 export function readConfig(logger: Logger): Config | null {
@@ -416,6 +420,12 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   // correlation has to live here as shellID → sessionID.
   const bgToolCalls = new Map<string, string>()
   const backgroundShells = new Map<string, string>()
+  // Exits seen for shells this instance never registered. Registration is
+  // deferred behind the async directory fetch, so an exit can land first —
+  // without this, the queued registration would resurrect a dead shell and
+  // wedge suppression until session.deleted. Size-capped; shell ids are
+  // unique per server, so stale entries only ever skip a dead id.
+  const recentShellExits = new Map<string, string>()
 
   function cancelIdleDebounce(sessionID: string): void {
     const timer = idleDebounce.get(sessionID)
@@ -708,6 +718,16 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
           // with a "Cancelled" notice. Duplicate events are no-ops.
           cancelIdleDebounce(owner)
           logger.debug("Background shell released", { shellID, sessionID: owner, via: type })
+        } else {
+          // Unregistered (yet): remember it so a deferred registration of
+          // this shell (fetch race) is dropped instead of wedging
+          // suppression. Bounded by evicting the oldest entry.
+          recentShellExits.set(shellID, type)
+          if (recentShellExits.size > RECENT_SHELL_EXIT_CAP) {
+            const oldest = recentShellExits.keys().next().value
+            if (oldest !== undefined) recentShellExits.delete(oldest)
+          }
+          logger.debug("Unregistered shell exit recorded", { shellID, via: type })
         }
       }
       return
@@ -845,9 +865,17 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       const shellID = data?.metadata?.shellID
       const owner = typeof data?.id === "string" ? bgToolCalls.get(data.id) : undefined
       if (owner && typeof shellID === "string") {
-        backgroundShells.set(shellID, owner)
-        bgToolCalls.delete(data.id)
-        logger.debug("Background shell registered", { sessionID: owner, shellID })
+        // The callID entry stays until success/failed: CodeMode shares one
+        // callID across several shells, and every progress under it must
+        // register its own shell.
+        if (recentShellExits.delete(shellID)) {
+          // This shell already exited before its registration landed (fetch
+          // race) — registering it would wedge suppression forever.
+          logger.debug("Skipping registration of already-exited shell", { sessionID: owner, shellID })
+        } else {
+          backgroundShells.set(shellID, owner)
+          logger.debug("Background shell registered", { sessionID: owner, shellID })
+        }
       }
       return
     }
@@ -862,8 +890,12 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
           // drop the entry so it cannot leak suppression.
           const shellID = data?.metadata?.shellID
           if (type === "session.tool.success" && typeof shellID === "string") {
-            backgroundShells.set(shellID, owner)
-            logger.debug("Background shell registered via success", { sessionID: owner, shellID })
+            if (recentShellExits.delete(shellID)) {
+              logger.debug("Skipping registration of already-exited shell", { sessionID: owner, shellID })
+            } else {
+              backgroundShells.set(shellID, owner)
+              logger.debug("Background shell registered via success", { sessionID: owner, shellID })
+            }
           }
           bgToolCalls.delete(callID)
         }
@@ -985,6 +1017,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     lastText.clear()
     bgToolCalls.clear()
     backgroundShells.clear()
+    recentShellExits.clear()
     sessions.clear()
     active.clear()
     errored.clear()

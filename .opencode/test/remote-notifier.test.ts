@@ -623,12 +623,20 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(shellToolSuccess("shl_2")) // callID entry released; shells stay
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
-    expect(calls.length).toBe(0)
-    // A later turn with shl_2 still running stays suppressed too.
+    expect(calls.length).toBe(0) // both shells pending
+    // shl_1 exits and the woken turn finishes — shl_2 is still running, so
+    // the second shell must still suppress idle.
+    n.handleEvent(shellExited("shl_1"))
     n.handleEvent(execStarted(SESSION_ID))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
     expect(calls.length).toBe(0)
+    // The last shell exits — the next finished turn is genuine idleness.
+    n.handleEvent(shellExited("shl_2"))
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(1)
   })
 
   test("shell.exited cancels the pending idle debounce of the owning session", async () => {
@@ -706,6 +714,27 @@ describe("idle notifications (background shell waiting)", () => {
     n.handleEvent(execStarted(SESSION_ID))
     n.handleEvent(execSucceeded(SESSION_ID))
     await sleep(50)
+    expect(calls.length).toBe(1)
+  })
+
+  test("a shell that exits before its deferred registration does not wedge suppression", async () => {
+    const calls: SentCall[] = []
+    // Session directory unknown (no session.created, location-less tool
+    // events) — tool events queue behind the async directory fetch.
+    const n = makeNotifier((p) => calls.push(p), PLUGIN_DIR, {
+      resolveSession: async () => ({ directory: PLUGIN_DIR }),
+    })
+    n.handleEvent(ev("session.tool.called", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", name: "shell", input: { command: "false", background: true }, executed: true }, null))
+    n.handleEvent(ev("session.tool.progress", { sessionID: SESSION_ID, assistantMessageID: "msg_1", id: "call_1", metadata: { shellID: "shl_1" } }, null))
+    // The fast-failing shell exits while the fetch is still in flight —
+    // the shell is not registered yet, so this is a no-op on its own.
+    n.handleEvent(shellExited("shl_1"))
+    await sleep(20) // queued registration lands after the exit
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    // The shell is already dead — registering it now would wedge suppression
+    // forever. The turn that finished after the wake is genuine idleness.
     expect(calls.length).toBe(1)
   })
 })
