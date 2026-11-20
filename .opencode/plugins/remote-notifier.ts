@@ -409,6 +409,13 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   // session.text.ended). Cleared when a new execution starts so idle
   // notifications preview only the turn that just finished.
   const lastText = new Map<string, string>()
+  // Background-shell tracking spans two event domains: session.tool.called
+  // (input.background) identifies the background call, but only
+  // session.tool.progress/success carry the shellID, and the later
+  // shell.exited/deleted events carry no sessionID at all — so the id
+  // correlation has to live here as shellID → sessionID.
+  const bgToolCalls = new Map<string, string>()
+  const backgroundShells = new Map<string, string>()
 
   function cancelIdleDebounce(sessionID: string): void {
     const timer = idleDebounce.get(sessionID)
@@ -438,6 +445,33 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   function hasActiveChild(parentID: string): boolean {
     for (const id of active) {
       if (sessions.get(id)?.parentID === parentID) return true
+    }
+    return false
+  }
+
+  // True if candidateID sits anywhere below ancestorID in the sub-agent
+  // tree (candidate itself, a child, or a nested child). Guarded against
+  // parentID cycles.
+  function isDescendantOf(candidateID: string, ancestorID: string): boolean {
+    const seen = new Set<string>()
+    let current: string | undefined = candidateID
+    while (current !== undefined && !seen.has(current)) {
+      if (current === ancestorID) return true
+      seen.add(current)
+      current = sessions.get(current)?.parentID
+    }
+    return false
+  }
+
+  // True while a background shell owned by this session (or one of its
+  // sub-agent descendants — OpenCode's own job semantics include background
+  // jobs owned by child and nested subagent sessions) is still pending. When
+  // the agent starts a background shell and ends its turn, the shell's exit
+  // wakes it via a synthetic message, so this idle is a wait, not genuine
+  // idleness.
+  function hasPendingBackgroundShell(sessionID: string): boolean {
+    for (const owner of backgroundShells.values()) {
+      if (isDescendantOf(owner, sessionID)) return true
     }
     return false
   }
@@ -565,6 +599,14 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       return
     }
 
+    // Suppress idle while a background shell the session is waiting on is
+    // still pending — the shell's exit wakes it (synthetic message), so this
+    // idle is a wait, not genuine idleness.
+    if (hasPendingBackgroundShell(sessionID)) {
+      logger.debug("Idle with background shell pending — suppressing", { sessionID })
+      return
+    }
+
     if (!config.events.idle.enabled) return
 
     // Schedule idle debounce — another plugin (or the user) may resume the
@@ -577,6 +619,12 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       // signal and now (cross-session event ordering is not guaranteed).
       if (hasActiveChild(sessionID)) {
         logger.debug("Idle debounce fired with child active — suppressing", { sessionID })
+        return
+      }
+      // Same race for background shells: the shell tool events may land
+      // after the idle signal but before the debounce fires.
+      if (hasPendingBackgroundShell(sessionID)) {
+        logger.debug("Idle debounce fired with background shell pending — suppressing", { sessionID })
         return
       }
       logger.debug("Idle debounce fired", { sessionID })
@@ -742,6 +790,54 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     if (type === "session.text.ended") {
       if (sessionID && typeof data?.text === "string" && data.text.trim()) {
         lastText.set(sessionID, data.text.slice(0, 400))
+      }
+      return
+    }
+
+    // ---- Background shell tracking ----
+    // session.tool.called is the only reliable foreground/background signal
+    // (shell.created's metadata carries just {sessionID} for both kinds);
+    // progress/success then reveal the shellID. shell.exited/deleted later
+    // carry only {id}, so the correlation is kept in backgroundShells.
+    if (type === "session.tool.called") {
+      if (
+        sessionID &&
+        data?.name === "shell" &&
+        data?.input?.background === true &&
+        typeof data?.id === "string"
+      ) {
+        bgToolCalls.set(data.id, sessionID)
+        logger.debug("Background shell tool call seen", { sessionID, callID: data.id })
+      }
+      return
+    }
+
+    if (type === "session.tool.progress") {
+      const shellID = data?.metadata?.shellID
+      const owner = typeof data?.id === "string" ? bgToolCalls.get(data.id) : undefined
+      if (owner && typeof shellID === "string") {
+        backgroundShells.set(shellID, owner)
+        bgToolCalls.delete(data.id)
+        logger.debug("Background shell registered", { sessionID: owner, shellID })
+      }
+      return
+    }
+
+    if (type === "session.tool.success" || type === "session.tool.failed") {
+      const callID = data?.id
+      if (typeof callID === "string") {
+        const owner = bgToolCalls.get(callID)
+        if (owner) {
+          // Progress is ephemeral and can be missed; success metadata repeats
+          // the shellID as a fallback. A failed call never created a shell —
+          // drop the entry so it cannot leak suppression.
+          const shellID = data?.metadata?.shellID
+          if (type === "session.tool.success" && typeof shellID === "string") {
+            backgroundShells.set(shellID, owner)
+            logger.debug("Background shell registered via success", { sessionID: owner, shellID })
+          }
+          bgToolCalls.delete(callID)
+        }
       }
       return
     }
