@@ -308,7 +308,8 @@ function questionLines(form: any): { lines: string; options: string } {
 //   permission permission.asked          data.{sessionID, action, resources}
 //   question   form.created              data.form.{sessionID, title}
 //   idle       session.status            data.{sessionID, status.type}
-// dispatch() injects project.name (directory basename) and lastText (the
+// dispatch() injects project.name (repository name — the main repo, not the
+// worktree, when the location is a linked git worktree) and lastText (the
 // finished turn's last assistant text, tracked from session.text.ended).
 export function buildMessage(config: Config, type: EventType, payload: any, sessionTitle?: string | null): { title: string; message: string } {
   const emoji = EVENT_EMOJI[type]
@@ -367,6 +368,41 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
   }
 }
 
+// ---- Project name resolution ----
+// Fallback for hosts that don't provide the project's canonical directory:
+// the notification label must be the project (repository) name, not the
+// directory name — inside a linked git worktree (e.g. .codenomad/worktrees/x)
+// the directory basename is the worktree name. The .git marker tells them
+// apart without spawning git: a linked worktree's .git is a file
+// "gitdir: <mainRoot>/.git/worktrees/<name>", while the main worktree (and
+// non-repo directories) resolve to their own basename.
+export function resolveProjectName(directory: string): string {
+  const fallback = path.basename(directory) || directory
+  try {
+    const dotGit = path.join(directory, ".git")
+    const stat = fs.statSync(dotGit)
+    // Main worktree: .git is a directory and the dir name IS the project name.
+    if (stat.isDirectory()) return fallback
+    if (!stat.isFile()) return fallback
+    const raw = fs.readFileSync(dotGit, "utf8")
+    const m = /^gitdir:\s*(.+)$/m.exec(raw)
+    if (!m) return fallback
+    // Normalize (also resolves relative gitdir paths against the worktree).
+    // m[1] always exists: the group is non-optional in the regex above.
+    const gitdir = path.resolve(directory, m[1]!.trim())
+    // Linked worktree metadata lives at <mainRoot>/.git/worktrees/<name>.
+    // Submodules point into <main>/.git/modules/<name> instead — those keep
+    // the directory basename (a submodule is its own project).
+    const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`
+    const idx = gitdir.indexOf(marker)
+    if (idx === -1) return fallback
+    return path.basename(gitdir.slice(0, idx)) || fallback
+  } catch {
+    // No .git (or unreadable) — not a worktree; keep the directory name.
+    return fallback
+  }
+}
+
 // ---- Notifier core ----
 // Owns all per-instance state (session map, debounce timers) so the plugin
 // can be unloaded cleanly and multiple locations never share state.
@@ -386,6 +422,14 @@ export interface NotifierDeps {
    * single-instance behavior) and unknown titles fall back to the event label.
    */
   resolveSession?: (sessionID: string) => Promise<{ directory: string | null; title?: string | null; parentID?: string | null } | null>
+  /**
+   * Notification project label. Production wiring derives it from
+   * ctx.location.project.canonical — OpenCode resolves the repository's
+   * canonical directory itself (the main checkout, not the linked worktree,
+   * when the location is one). When absent (tests, hosts without project
+   * info), createNotifier falls back to reading the .git marker.
+   */
+  projectName?: string
 }
 
 export function createNotifier(config: Config, logger: Logger, projectDir: string, deps: NotifierDeps = {}) {
@@ -393,6 +437,10 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   const idleDebounceMs = deps.idleDebounceMs ?? IDLE_DEBOUNCE_MS
   const permissionDebounceMs = deps.permissionDebounceMs ?? PERMISSION_DEBOUNCE_MS
   const resolveSession = deps.resolveSession
+  // Notification label: the repository name (worktree-aware). Prefer the name
+  // OpenCode resolved (deps.projectName, from ctx.location.project.canonical);
+  // fall back to reading the .git marker ourselves.
+  const projectName = deps.projectName ?? resolveProjectName(projectDir)
   const limiter = new RateLimiter(config.rateLimit.dedupWindowSec, config.rateLimit.maxPerMinute, logger)
 
   const sessions = new Map<string, SessionInfo>()
@@ -545,32 +593,30 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     eventType: EventType,
     data: any,
     sessionID: string | undefined,
-    eventDir: string | null,
   ): void {
     const info = sessionID ? sessions.get(sessionID) : undefined
     if (!sessionID || !info || info.title !== undefined || !resolveSession) {
-      dispatch(eventType, data, sessionID, eventDir)
+      dispatch(eventType, data, sessionID)
       return
     }
-    void ensureTitle(sessionID).then(() => dispatch(eventType, data, sessionID, eventDir))
+    void ensureTitle(sessionID).then(() => dispatch(eventType, data, sessionID))
   }
 
   function dispatch(
     eventType: EventType,
     data: any,
     sessionID: string | undefined,
-    eventDir: string | null,
   ): void {
     const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
     // idle naturally dedups via the active set; other events use per-key dedup.
     if (!limiter.allow(dedupKey, eventType === "idle")) return
 
     const sessionTitle = sessionID ? sessions.get(sessionID)?.title ?? null : null
-    // Prefer the session's own directory (learned from session.created or the
-    // session API), then the event envelope location; the plugin instance's
-    // directory is only the fallback for events without a location.
-    const sessionDir = sessionID ? sessions.get(sessionID)?.directory ?? null : null
-    const project = path.basename(sessionDir ?? eventDir ?? projectDir)
+    // Ownership gating guarantees the session's directory equals this
+    // instance's projectDir, so the worktree-aware project name resolved at
+    // init is always the right label (sessionDir/eventDir would only repeat
+    // it — or, in a worktree, show the worktree name).
+    const project = projectName
     const extra = eventType === "idle" && sessionID
       ? { lastText: lastText.get(sessionID) }
       : {}
@@ -597,7 +643,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
   // session.status has no emitter). Runs the mature suppress checks (no prior
   // busy / trailing idle after error / sub-agent child / parent with an active
   // child) then schedules the idle debounce.
-  function handleIdleSignal(sessionID: string, data: any, eventDir: string | null): void {
+  function handleIdleSignal(sessionID: string, data: any): void {
     // Suppress no-op idle (session was never busy first).
     if (!active.has(sessionID)) {
       logger.debug("Idle without prior busy — suppressing", { sessionID })
@@ -655,7 +701,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         return
       }
       logger.debug("Idle debounce fired", { sessionID })
-      dispatchWithTitle("idle", data, sessionID, eventDir)
+      dispatchWithTitle("idle", data, sessionID)
     }, idleDebounceMs)
     idleDebounce.set(sessionID, timer)
     logger.debug("Idle debounce scheduled", { sessionID, ms: idleDebounceMs })
@@ -820,7 +866,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       // event order is preserved.
       if (!resolveSession) {
         // Legacy single-instance behavior: assume the session is local.
-        processSessionEvent(type, data, sessionID, eventDir)
+        processSessionEvent(type, data, sessionID)
         return
       }
       const run = async () => {
@@ -839,7 +885,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
           logger.debug("Foreign session — skipping", { sessionID, sessionDir: fresh.directory })
           return
         }
-        processSessionEvent(type, data, sessionID, eventDir)
+        processSessionEvent(type, data, sessionID)
       }
       const prev = pending.get(sessionID) ?? Promise.resolve()
       pending.set(sessionID, prev.then(run, run))
@@ -850,7 +896,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       logger.debug("Foreign session — skipping", { sessionID, sessionDir: dir })
       return
     }
-    processSessionEvent(type, data, sessionID, eventDir)
+    processSessionEvent(type, data, sessionID)
   }
 
   // Handles a session-scoped event — only called for sessions this instance
@@ -859,7 +905,6 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     type: string,
     data: any,
     sessionID: string | undefined,
-    eventDir: string | null,
   ): void {
     // ---- Last assistant text: idle notifications preview the finished turn ----
     // session.text.ended carries the final text of each assistant part; the
@@ -979,7 +1024,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     }
 
     if (type === "session.execution.succeeded") {
-      if (sessionID) handleIdleSignal(sessionID, data, eventDir)
+      if (sessionID) handleIdleSignal(sessionID, data)
       return
     }
 
@@ -1000,7 +1045,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         return
       }
       if (statusType !== "idle") return
-      if (sessionID) handleIdleSignal(sessionID, data, eventDir)
+      if (sessionID) handleIdleSignal(sessionID, data)
       return
     }
 
@@ -1020,7 +1065,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       const timer = setTimeout(() => {
         permissionDebounce.delete(key)
         logger.debug("Permission debounce fired", { sessionID: key })
-        dispatchWithTitle("permission", data, sessionID, eventDir)
+        dispatchWithTitle("permission", data, sessionID)
       }, permissionDebounceMs)
       permissionDebounce.set(key, timer)
       logger.debug("Permission debounce scheduled", { sessionID: key, ms: permissionDebounceMs })
@@ -1052,7 +1097,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         errored.add(sessionID)
         cancelIdleDebounce(sessionID)
       }
-      dispatchWithTitle("error", data, sessionID, eventDir)
+      dispatchWithTitle("error", data, sessionID)
       return
     }
 
@@ -1064,7 +1109,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
         return
       }
       if (sessionID) cancelIdleDebounce(sessionID)
-      dispatchWithTitle("question", data, sessionID, eventDir)
+      dispatchWithTitle("question", data, sessionID)
       return
     }
   }
@@ -1195,6 +1240,13 @@ export default Plugin.define({
     })
 
     const notifier = createNotifier(config, logger, ctx.location.directory, {
+      // Project label: OpenCode resolves the repository's canonical directory
+      // (the main checkout — never a linked worktree — via its own cached git
+      // discovery); its basename is the stable project name. Older runtimes
+      // without this field fall back to the .git-marker resolution.
+      projectName: typeof ctx.location?.project?.canonical === "string"
+        ? path.basename(ctx.location.project.canonical)
+        : undefined,
       // Ownership + title resolver: looks up which directory a session
       // belongs to when this instance missed session.created, and the
       // session's current title when session.renamed already fired before

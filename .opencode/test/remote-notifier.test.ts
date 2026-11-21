@@ -6,7 +6,7 @@ import { describe, test, expect } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import pluginDefault, { buildMessage, createNotifier, RateLimiter, readConfig, subscribeWithRetry } from "../plugins/remote-notifier.ts"
+import pluginDefault, { buildMessage, createNotifier, RateLimiter, readConfig, resolveProjectName, subscribeWithRetry } from "../plugins/remote-notifier.ts"
 import type { Config, NotifierDeps } from "../plugins/remote-notifier.ts"
 
 // ---- Fixtures ----
@@ -1434,5 +1434,93 @@ describe("readConfig", () => {
     withHome({}, () => {
       expect(readConfig(silentLogger)).toBeNull()
     })
+  })
+})
+
+// ---- Project name resolution (worktree-aware label) ----
+
+describe("project name resolution", () => {
+  // Creates a fake linked-worktree layout on disk:
+  //   <root>/my-project/.git/worktrees/feat-x   (git's metadata, content irrelevant)
+  //   <worktreeDir>/.git                        (file: "gitdir: <main>/.git/worktrees/feat-x")
+  function makeWorktree(mainName: string, worktreeName: string, gitdirBody?: (main: string, wt: string) => string) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "notifier-wt-"))
+    const main = path.join(root, mainName)
+    const worktree = path.join(main, ".codenomad", "worktrees", worktreeName)
+    fs.mkdirSync(worktree, { recursive: true })
+    const body = gitdirBody
+      ? gitdirBody(main, worktree)
+      : `gitdir: ${main}/.git/worktrees/${worktreeName}\n`
+    fs.writeFileSync(path.join(worktree, ".git"), body)
+    return { main, worktree }
+  }
+
+  test("linked worktree resolves to the main repository name", () => {
+    const { worktree } = makeWorktree("my-project", "feat-x")
+    expect(resolveProjectName(worktree)).toBe("my-project")
+  })
+
+  test("relative gitdir path resolves against the worktree", () => {
+    // A worktree created outside the main repo (git worktree add ../feat-x)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "notifier-wt-"))
+    const main = path.join(root, "my-project")
+    const worktree = path.join(root, "feat-x")
+    fs.mkdirSync(worktree, { recursive: true })
+    fs.writeFileSync(path.join(worktree, ".git"), "gitdir: ../my-project/.git/worktrees/feat-x\n")
+    expect(resolveProjectName(worktree)).toBe("my-project")
+  })
+
+  test("main worktree (.git directory) keeps its own basename", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "notifier-wt-"))
+    const main = path.join(root, "my-project")
+    fs.mkdirSync(path.join(main, ".git"), { recursive: true })
+    expect(resolveProjectName(main)).toBe("my-project")
+  })
+
+  test("directory without .git falls back to its basename", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "notifier-wt-"))
+    expect(resolveProjectName(path.join(root, "plain-dir"))).toBe("plain-dir")
+  })
+
+  test("submodule gitdir falls back to the directory basename", () => {
+    // Submodules point into <main>/.git/modules/<name>, not .../worktrees/...
+    const { worktree } = makeWorktree("my-project", "sub", (main) => `gitdir: ${main}/.git/modules/sub\n`)
+    expect(resolveProjectName(worktree)).toBe("sub")
+  })
+
+  test("notifications show the project name, not the worktree name", () => {
+    const { worktree } = makeWorktree("my-project", "feat-x")
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), worktree)
+    n.handleEvent(sessionCreated({ location: { directory: worktree } }))
+    n.handleEvent(ev("session.status", { sessionID: SESSION_ID, status: { type: "busy" } }, worktree))
+    n.handleEvent(
+      ev("session.execution.failed", {
+        sessionID: SESSION_ID,
+        error: { type: "provider.error", message: "boom", status: 500, response: "" },
+      }, worktree),
+    )
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.message).toBe("**my-project**\n\n```\nboom\n```")
+  })
+
+  test("deps.projectName (from ctx.location.project.canonical) wins over the fallback", () => {
+    // On disk this looks like a plain directory (fallback would say "feat-x");
+    // the name OpenCode resolved must win.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "notifier-wt-"))
+    const worktree = path.join(root, "feat-x")
+    fs.mkdirSync(worktree, { recursive: true })
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p), worktree, { projectName: "my-project" })
+    n.handleEvent(sessionCreated({ location: { directory: worktree } }))
+    n.handleEvent(ev("session.status", { sessionID: SESSION_ID, status: { type: "busy" } }, worktree))
+    n.handleEvent(
+      ev("session.execution.failed", {
+        sessionID: SESSION_ID,
+        error: { type: "provider.error", message: "boom", status: 500, response: "" },
+      }, worktree),
+    )
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.message).toBe("**my-project**\n\n```\nboom\n```")
   })
 })
