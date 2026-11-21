@@ -99,10 +99,12 @@ Events handled: `session.execution.failed` (error), `permission.asked` / `permis
 
 1. The session was busy first (no no-op idles), and the idle doesn't trail an error notification
 2. The session is not a sub-agent child, and no sub-agent child of it is still working
-3. **No background shell is pending**: when the agent starts a background shell and ends its turn, the shell's exit wakes it (a synthetic message resumes the session), so the waiting period is not idleness. The plugin tracks this via `session.tool.called` (`name: "shell"`, `input.background: true`) correlated with `session.tool.progress`/`success` (`metadata.shellID`), and releases it on `shell.exited` / `shell.deleted` / `session.deleted`
+3. **No background shell is pending**: when the agent starts a background shell and ends its turn, the shell's exit wakes it (a synthetic message resumes the session), so the waiting period is not idleness. Background shells have two origins, both tracked:
+   - Explicit: `session.tool.called` (`name: "shell"`, `input.background: true`) correlated with `session.tool.progress`/`success` (`metadata.shellID`)
+   - Timeout-converted: a *foreground* shell that outlived its timeout is moved to the background by OpenCode — the call succeeds with `metadata: { status: "running", shellID }` while `input.background` never appears; the plugin registers it from that success metadata
+   - Released on `shell.exited` / `shell.deleted` / `session.deleted`
    - Sessions waiting on a sub-agent's background shell are covered too (OpenCode's job semantics include background jobs owned by descendant sessions)
    - A background shell that never exits (e.g. a dev server) suppresses idle indefinitely — the session is genuinely waiting for it to wake
-   - Not covered: a user manually moving a *foreground* shell to the background (the tool call's `background` input was false)
 
 ## Development
 

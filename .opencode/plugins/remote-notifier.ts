@@ -878,6 +878,11 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     // marks the call as background. progress/success then reveal the
     // shellID. shell.exited/deleted later carry only {id}, so the
     // correlation is kept in backgroundShells.
+    // A background shell has TWO origins: an explicit input.background call,
+    // or a foreground command that outlived its timeout — OpenCode moves it
+    // to the background and the tool succeeds with metadata
+    // { status: "running", shellID } while input stays background-less (see
+    // the success handler below).
     //
     // NOTE on `executed`: in v2.3 it means "executed by the provider", and
     // the shell tool always executes locally — so it is false for every
@@ -926,13 +931,26 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     if (type === "session.tool.success" || type === "session.tool.failed") {
       const callID = data?.id
       if (typeof callID === "string") {
+        const isShellCall = data?.name === "shell" || shellCallIDs.has(callID)
         shellCallIDs.delete(callID)
-        const owner = bgToolCalls.get(callID)
+        const shellID = data?.metadata?.shellID
+        // Owner resolution covers two background origins:
+        // 1. Explicitly background calls, registered from called
+        //    (input.background === true).
+        // 2. Foreground shells that outlived their timeout and were moved to
+        //    the background by OpenCode — input.background never appears;
+        //    the only marker is success metadata reporting the shell still
+        //    running (status:"running" + shellID, observed live on 2.3).
+        const timedOutToBackground =
+          type === "session.tool.success" &&
+          isShellCall &&
+          data?.metadata?.status === "running" &&
+          typeof shellID === "string"
+        const owner = bgToolCalls.get(callID) ?? (timedOutToBackground && sessionID ? sessionID : undefined)
         if (owner) {
           // Progress is ephemeral and can be missed; success metadata repeats
           // the shellID as a fallback. A failed call never created a shell —
           // drop the entry so it cannot leak suppression.
-          const shellID = data?.metadata?.shellID
           if (type === "session.tool.success" && typeof shellID === "string") {
             if (recentShellExits.delete(shellID)) {
               logger.debug("Skipping registration of already-exited shell", { sessionID: owner, shellID })

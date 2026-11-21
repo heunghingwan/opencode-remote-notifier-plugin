@@ -691,6 +691,69 @@ describe("idle notifications (background shell waiting)", () => {
     expect(calls.length).toBe(0)
   })
 
+  // OpenCode v2.3 moves a FOREGROUND shell to the background when it outlives
+  // its timeout: the tool call then succeeds with metadata
+  // { status: "running", shellID } — input.background never appears (observed
+  // live: "Command moved to the background (shell ID: sh_...). The command
+  // did not finish within its timeout of 120 seconds..."). That still-pending
+  // shell must suppress idle exactly like an explicit background shell.
+  const timeoutToBackgroundSuccess = (shellID = "shl_1", sessionID = SESSION_ID, callID = "call_1") =>
+    ev("session.tool.success", {
+      sessionID,
+      assistantMessageID: "msg_1",
+      id: callID,
+      metadata: { status: "running", truncated: false, shellID, pid: 4242 },
+    })
+
+  test("foreground shell moved to background by timeout suppresses the idle notification", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    emitShellCall(n, SESSION_ID, "call_1", { command: "python3 watch-pr.py 1636", timeout: 0 })
+    n.handleEvent(timeoutToBackgroundSuccess("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("timeout-converted background shell is released by shell.exited", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    emitShellCall(n, SESSION_ID, "call_1", { command: "python3 watch-pr.py 1636", timeout: 0 })
+    n.handleEvent(timeoutToBackgroundSuccess("shl_1"))
+    n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
+    n.handleEvent(shellExited("shl_1")) // wake-up cancels the debounce
+    await sleep(50)
+    expect(calls.length).toBe(0)
+    // After the wake-up ran its course, the next genuine idle notifies again.
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+  })
+
+  test("foreground shell that completed normally does not suppress idle", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    emitShellCall(n, SESSION_ID, "call_1", { command: "ls" })
+    n.handleEvent(
+      ev("session.tool.success", {
+        sessionID: SESSION_ID,
+        assistantMessageID: "msg_1",
+        id: "call_1",
+        metadata: { status: "completed", truncated: false, exitCode: 0, duration: 1200 },
+      }),
+    )
+    n.handleEvent(execSucceeded(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(1)
+  })
+
   test("a background tool call that fails without a shell does not leak suppression", async () => {
     const calls: SentCall[] = []
     const n = makeNotifier((p) => calls.push(p))
