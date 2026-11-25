@@ -6,8 +6,8 @@ import { describe, test, expect } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import pluginDefault, { buildMessage, createNotifier, RateLimiter, readConfig, resolveProjectName, subscribeWithRetry } from "../plugins/remote-notifier.ts"
-import type { Config, NotifierDeps } from "../plugins/remote-notifier.ts"
+import pluginDefault, { buildMessage, createNotifier, RateLimiter, readConfig, resolveProjectName, subscribeWithRetry } from "../src/index.ts"
+import type { Config, NotifierDeps } from "../src/index.ts"
 
 // ---- Fixtures ----
 

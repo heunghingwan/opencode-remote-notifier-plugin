@@ -8,9 +8,9 @@ import { describe, test, expect } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import pluginDefault, { buildMessage, createNotifier } from "../plugins/remote-notifier.ts"
-import type { Config, NotifierDeps } from "../plugins/remote-notifier.ts"
-import { NotifierRpc, asNotifyInput } from "../plugins/rpc.ts"
+import pluginDefault, { buildMessage, createNotifier } from "../src/index.ts"
+import type { Config, NotifierDeps } from "../src/index.ts"
+import { NotifierRpc, asNotifyInput } from "../src/rpc.ts"
 
 // ---- Fixtures (mirroring remote-notifier.test.ts) ----
 

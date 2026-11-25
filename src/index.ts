@@ -4,35 +4,20 @@ import path from "node:path"
 
 import { NotifierRpc, asNotifyInput } from "./rpc.ts"
 import type { NotifyInput } from "./rpc.ts"
+import { createFileLogger } from "./logger.ts"
 
 // ---- Logger ----
-// V2 plugin context has no structured log endpoint; console output is
-// captured by the server log (filter role=server).
+// OpenCode plugins have no server-log API, and console output is discarded
+// by the background service (its stdout is not the log file) — so the
+// plugin logs to its own JSONL file (src/logger.ts). The Logger interface
+// stays local so tests keep injecting silent stubs.
 
-type LoggerLevel = "debug" | "info" | "warn" | "error"
 
 export interface Logger {
   debug(message: string, extra?: Record<string, unknown>): void
   info(message: string, extra?: Record<string, unknown>): void
   warn(message: string, extra?: Record<string, unknown>): void
   error(message: string, extra?: Record<string, unknown>): void
-}
-
-function createLogger(): Logger {
-  const log = (level: LoggerLevel, message: string, extra?: Record<string, unknown>) => {
-    const suffix = extra && Object.keys(extra).length > 0 ? ` ${JSON.stringify(extra)}` : ""
-    const line = `[remote-notifier] ${message}${suffix}`
-    if (level === "error") console.error(line)
-    else if (level === "warn") console.warn(line)
-    else if (level === "debug") console.debug(line)
-    else console.log(line)
-  }
-  return {
-    debug: (msg, extra) => log("debug", msg, extra),
-    info: (msg, extra) => log("info", msg, extra),
-    warn: (msg, extra) => log("warn", msg, extra),
-    error: (msg, extra) => log("error", msg, extra),
-  }
 }
 
 // ---- Types ----
@@ -1333,7 +1318,7 @@ export async function subscribeWithRetry(opts: SubscribeRetryOptions): Promise<v
 export default Plugin.define({
   id: "remote-notifier",
   setup(ctx) {
-    const logger = createLogger()
+    const logger = createFileLogger()
     const config = readConfig(logger)
     if (!config) {
       logger.warn("Config not found/invalid, plugin disabled")

@@ -144,13 +144,30 @@ Events handled: `session.execution.failed` (error), `permission.asked` / `permis
    - Sessions waiting on a sub-agent's background shell are covered too (OpenCode's job semantics include background jobs owned by descendant sessions)
    - A background shell that never exits (e.g. a dev server) suppresses idle indefinitely — the session is genuinely waiting for it to wake
 
+## Logging
+
+The plugin keeps its own JSONL audit log at `~/.local/share/opencode/log/remote-notifier.log`: every notification sent or suppressed (and why — sub-agent idles, rate-limit drops, foreign sessions), stream reconnects, and config problems. OpenCode plugins have no log API and the background service discards console output, so this file is the only production audit line.
+
+- Override the path with the `REMOTE_NOTIFIER_LOG` environment variable (the test suite uses this to stay off your real log)
+- Rotates to `remote-notifier.log.1` once the file exceeds 2 MiB
+- A failing log write never breaks notifications: at most three `console.error`s, then silent
+
 ## Development
 
 ```sh
-bun install        # root + .opencode/
-bun test           # unit tests (.opencode/test/)
+bun install        # dependencies at the repo root (@opencode/plugin)
+bun test           # unit tests (test/)
 bun run typecheck  # tsc --noEmit
 ```
+
+Source lives in `src/`, outside OpenCode's auto-scanned `.opencode/plugins/` directories — opening a session inside this repo does **not** load the plugin. To exercise it live, point a throwaway directory (outside this repo) at the checkout:
+
+```jsonc
+// <throwaway-dir>/opencode.jsonc
+{ "plugins": ["file:///path/to/opencode-remote-notifier-plugin"] }
+```
+
+and open the session there; source edits hot-reload. Production installs use the `git+https` reference from the Install section above.
 
 ## License
 

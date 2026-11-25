@@ -11,5 +11,5 @@
     "allowImportingTsExtensions": true,
     "noUncheckedIndexedAccess": true
   },
-  "include": [".opencode/plugins/**/*.ts", ".opencode/test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"]
 }
