@@ -117,6 +117,11 @@ const formCreated = (sessionID = SESSION_ID) =>
 const textEnded = (text: string, sessionID = SESSION_ID) =>
   ev("session.text.ended", { sessionID, assistantMessageID: "msg_1", ordinal: 0, text })
 
+// OpenCode's SessionMove service is global: session.moved carries NO event
+// envelope location, and data.location is the destination Location.Ref.
+const sessionMoved = (directory: string, sessionID = SESSION_ID) =>
+  ev("session.moved", { sessionID, location: { directory }, projectID: "prj_1", subpath: "" }, null)
+
 interface SentCall {
   title: string
   message: string
@@ -1261,6 +1266,87 @@ describe("multi-location ownership (one plugin instance per location)", () => {
     await sleep(50)
     expect(calls.length).toBe(1)
     expect(calls[0]!.message).toContain("**gamma**")
+  })
+})
+
+// ---- Session moves (duplicate-notification regression) ----
+// OpenCode V2 delivers every event to every plugin instance: the promise
+// adapter's subscription runs without an ambient Location, so the bus's
+// location filter is off (all instances see the global stream). A session
+// moved via session.move (or into a worktree — same mechanism) publishes
+// session.moved — no envelope location, data.location = destination — and
+// its later events carry the destination on the envelope. The instance the
+// session LEFT must stop notifying for it; only the instance at the session's
+// current location may act. A stale session.created-era cache must never
+// overrule the event's live location.
+
+describe("session move (duplicate-notification regression)", () => {
+  test("a session moved to another location stops notifying from the old instance", async () => {
+    const alpha: SentCall[] = []
+    const beta: SentCall[] = []
+    const a = makeNotifier((p) => alpha.push(p), "/home/dev/work/alpha")
+    const b = makeNotifier((p) => beta.push(p), "/home/dev/work/beta")
+    // Session runs and idles in alpha: only alpha notifies.
+    for (const n of [a, b]) {
+      n.handleEvent(sessionCreated({ location: { directory: "/home/dev/work/alpha" } }))
+      n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, "/home/dev/work/alpha"))
+      n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, "/home/dev/work/alpha"))
+    }
+    await sleep(50)
+    expect(alpha.length).toBe(1)
+    expect(beta.length).toBe(0)
+    // The session moves to beta; both instances see session.moved.
+    for (const n of [a, b]) n.handleEvent(sessionMoved("/home/dev/work/beta"))
+    // A new turn runs and idles in beta: only beta notifies.
+    for (const n of [a, b]) {
+      n.handleEvent(ev("session.execution.started", { sessionID: SESSION_ID }, "/home/dev/work/beta"))
+      n.handleEvent(ev("session.execution.succeeded", { sessionID: SESSION_ID }, "/home/dev/work/beta"))
+    }
+    await sleep(50)
+    expect(beta.length).toBe(1)
+    expect(alpha.length).toBe(1) // unchanged — the old instance stayed silent
+  })
+
+  test("the post-move envelope location overrides the stale session.created cache", async () => {
+    const alpha: SentCall[] = []
+    const beta: SentCall[] = []
+    const a = makeNotifier((p) => alpha.push(p), "/home/dev/work/alpha")
+    const b = makeNotifier((p) => beta.push(p), "/home/dev/work/beta")
+    // Both instances saw the session created in alpha; session.moved was
+    // missed (stream gap), so only the envelope tells where it lives now.
+    for (const n of [a, b]) n.handleEvent(sessionCreated({ location: { directory: "/home/dev/work/alpha" } }))
+    for (const n of [a, b]) {
+      n.handleEvent(ev("session.execution.failed", {
+        sessionID: SESSION_ID,
+        error: { type: "provider.error", message: "boom" },
+      }, "/home/dev/work/beta"))
+    }
+    await sleep(30)
+    expect(beta.length).toBe(1)
+    expect(alpha.length).toBe(0)
+  })
+
+  test("envelope-less events after a move follow the session.moved destination", async () => {
+    const alpha: SentCall[] = []
+    const beta: SentCall[] = []
+    const a = makeNotifier((p) => alpha.push(p), "/home/dev/work/alpha")
+    const b = makeNotifier((p) => beta.push(p), "/home/dev/work/beta")
+    for (const n of [a, b]) n.handleEvent(sessionCreated({ location: { directory: "/home/dev/work/alpha" } }))
+    for (const n of [a, b]) n.handleEvent(sessionMoved("/home/dev/work/beta"))
+    // permission.asked may be published from a global context (no envelope);
+    // the moved session's owner is the destination instance.
+    for (const n of [a, b]) n.handleEvent(ev("permission.asked", {
+      id: "req_1",
+      sessionID: SESSION_ID,
+      action: "edit",
+      resources: ["src/a.ts"],
+      save: false,
+      metadata: {},
+      source: "session",
+    }, null))
+    await sleep(50)
+    expect(beta.length).toBe(1)
+    expect(alpha.length).toBe(0)
   })
 })
 

@@ -122,6 +122,7 @@ The plugin subscribes to OpenCode's V2 server event stream (`ctx.event.subscribe
 2. `session.renamed` events update the cached title; when a notification fires, the real title is included
 3. If the title is still the auto-generated default (`New session - ...`) or unknown, the title falls back to the short event label (e.g. `💤 Idle`)
 4. `session.renamed` fires exactly once per session — if the instance subscribed after that (server restart, plugin reload, late location activation), the title is fetched via `ctx.session.get` right before notifying, so it is never silently blank
+5. Each plugin instance only notifies for sessions whose **current** location is its own: every instance receives every event (the bus's location filter is off for plugin subscriptions), so ownership follows the event's envelope location, and `session.moved` refreshes the cached directory — a session moved to another directory (or into a worktree) stops notifying from the instance it left, instead of notifying from both (fixed in 2.3.1)
 
 Notification bodies carry event-specific content (the title's emoji identifies the event type, so bodies skip type headings). Every body is prefixed with the project label — the **repository name** as OpenCode resolves it (`ctx.location.project.canonical`): inside a linked git worktree (e.g. `.codenomad/worktrees/<branch>`) the main repository's name is shown, never the worktree's directory name. A `.git`-marker fallback covers hosts without project info:
 
@@ -130,7 +131,7 @@ Notification bodies carry event-specific content (the title's emoji identifies t
 - **error** shows the error message in a code block
 - **permission** shows the action and affected resources
 
-Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle). Tracked (no notification of their own): `session.created` / `renamed` / `deleted`, `session.tool.called` / `progress` / `success` / `failed`, `session.text.ended`, `shell.exited` / `shell.deleted` — the idle-suppression machinery below feeds on these.
+Events handled: `session.execution.failed` (error), `permission.asked` / `permission.replied` (permission), `form.created` (question), `session.status` idle/busy (idle). Tracked (no notification of their own): `session.created` / `renamed` / `moved` / `deleted`, `session.tool.called` / `progress` / `success` / `failed`, `session.text.ended`, `shell.exited` / `shell.deleted` — the idle-suppression machinery below feeds on these.
 
 **Idle suppression** — an idle signal is treated as genuine idleness only after these checks pass:
 

@@ -836,6 +836,31 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       return
     }
 
+    // ---- session.moved: the session changed location ----
+    // OpenCode V2's SessionMove publishes this from a global service with NO
+    // envelope location; data.location is the destination. The bus routes it
+    // to both the old and the new location, and — because plugin event
+    // subscriptions are unfiltered broadcasts — every instance receives it.
+    // Refresh the cached directory here so the ownership gate below tracks
+    // the session's live location: the instance the session LEFT must stop
+    // treating it as local, and the destination instance must own it (also
+    // for later events that carry no envelope location to compare against).
+    if (type === "session.moved") {
+      if (data?.sessionID) {
+        const prev = sessions.get(data.sessionID)
+        const loc = data?.location
+        const movedDir =
+          typeof loc === "string" ? loc : typeof loc?.directory === "string" ? loc.directory : undefined
+        sessions.set(data.sessionID, {
+          parentID: prev?.parentID,
+          title: prev?.title,
+          directory: movedDir ?? prev?.directory,
+        })
+        logger.debug("Session moved", { id: data.sessionID, directory: movedDir ?? null })
+      }
+      return
+    }
+
     // ---- shell.exited / shell.deleted: release background-shell tracking ----
     // These events carry no sessionID (just {id}), so they must run before the
     // ownership gate below — ownership was already established when the shell
@@ -923,11 +948,25 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       void ensureTitle(sessionID)
     }
 
-    // Seed the session's directory from the envelope location (authoritative
-    // for events published by the session's own location services).
+    // Refresh the session's directory from the envelope location. The
+    // envelope is authoritative for events published by the session's own
+    // location services: after a session.move (directory or worktree — same
+    // mechanism), post-move events carry the NEW location while the cache
+    // still holds the session.created-era one. Seeding only — never
+    // refreshing — is what let the instance the session LEFT keep matching
+    // its own directory and send duplicate notifications.
     if (eventDir) {
       const info = sessions.get(sessionID)!
-      if (info.directory === undefined) info.directory = eventDir
+      if (info.directory !== eventDir) {
+        if (info.directory !== undefined) {
+          logger.debug("Session directory updated from event envelope", {
+            sessionID,
+            from: info.directory,
+            to: eventDir,
+          })
+        }
+        info.directory = eventDir
+      }
     }
 
     const dir = sessions.get(sessionID)!.directory
