@@ -70,7 +70,7 @@ opencode plugin list
 | `error` | Session execution failures (LLM failures, API errors) | 5 (urgent) |
 | `permission` | Agent requests permission to access files | 4 (high) |
 | `question` | Agent asks the user a question | 4 (high) |
-| `idle` | Session becomes idle/waiting for input (suppressed while sub-agent children are still working, and while a background shell the session is waiting on is still pending) | 3 (default) |
+| `idle` | Session becomes idle/waiting for input (suppressed while sub-agents below it are still working — at any nesting depth — and while a background shell the session is waiting on is still pending) | 3 (default) |
 
 ### Rate Limiting
 
@@ -98,7 +98,7 @@ Events handled: `session.execution.failed` (error), `permission.asked` / `permis
 **Idle suppression** — an idle signal is treated as genuine idleness only after these checks pass:
 
 1. The session was busy first (no no-op idles), and the idle doesn't trail an error notification
-2. The session is not a sub-agent child, and no sub-agent child of it is still working
+2. The session is not a sub-agent, and no sub-agent below it (a direct child or a nested one) is still working — a child that handed off to its own sub-agent goes idle too, which must not read as the whole family finishing
 3. **No background shell is pending**: when the agent starts a background shell and ends its turn, the shell's exit wakes it (a synthetic message resumes the session), so the waiting period is not idleness. Background shells have two origins, both tracked:
    - Explicit: `session.tool.called` (`name: "shell"`, `input.background: true`) correlated with `session.tool.progress`/`success` (`metadata.shellID`)
    - Timeout-converted: a *foreground* shell that outlived its timeout is moved to the background by OpenCode — the call succeeds with `metadata: { status: "running", shellID }` while `input.background` never appears; the plugin registers it from that success metadata

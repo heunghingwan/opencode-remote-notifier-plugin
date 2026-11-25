@@ -519,6 +519,9 @@ describe("idle notifications (sub-agent orchestration)", () => {
   const execStarted = (sessionID: string) => ev("session.execution.started", { sessionID }, null)
   const execSucceeded = (sessionID: string) => ev("session.execution.succeeded", { sessionID }, null)
   const childCreated = () => sessionCreated({ parentID: SESSION_ID }, CHILD_ID)
+  const GRANDCHILD_ID = "ses_child789"
+  const grandchildCreated = () => sessionCreated({ parentID: CHILD_ID }, GRANDCHILD_ID)
+  const DEEP_ID = "ses_deep001"
 
   test("parent idle is suppressed while a sub-agent child is still working", async () => {
     const calls: SentCall[] = []
@@ -610,6 +613,84 @@ describe("idle notifications (sub-agent orchestration)", () => {
     n.handleEvent(childCreated())
     n.handleEvent(busy(CHILD_ID))
     n.handleEvent(idle(SESSION_ID))
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  // A sub-agent can spawn sub-agents of its own (subagent_depth > 1), so the
+  // working part of a family is not always a direct child of the root.
+  test("root idle is suppressed while a nested sub-agent is still working", async () => {
+    // Live sequence (2026-11-25 01:36): the root spawned a leader, the leader
+    // spawned an implementer and then ended its turn, which woke the root;
+    // the root's turn ended while the implementer was the only one executing.
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(childCreated())
+    n.handleEvent(execStarted(CHILD_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // root hands off to the child
+    n.handleEvent(grandchildCreated())
+    n.handleEvent(execStarted(GRANDCHILD_ID))
+    n.handleEvent(execSucceeded(CHILD_ID)) // child hands off to the grandchild
+    n.handleEvent(execStarted(SESSION_ID)) // root resumes with the child's result
+    n.handleEvent(execSucceeded(SESSION_ID)) // only the grandchild is executing
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("root idle is suppressed while a deeper nested sub-agent is still working", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(childCreated())
+    n.handleEvent(execStarted(CHILD_ID))
+    n.handleEvent(grandchildCreated())
+    n.handleEvent(execStarted(GRANDCHILD_ID))
+    n.handleEvent(sessionCreated({ parentID: GRANDCHILD_ID }, DEEP_ID))
+    n.handleEvent(execStarted(DEEP_ID))
+    n.handleEvent(execSucceeded(GRANDCHILD_ID)) // hands off to the deeper sub-agent
+    n.handleEvent(execSucceeded(CHILD_ID)) // hands off to the grandchild
+    n.handleEvent(execSucceeded(SESSION_ID)) // only the deepest sub-agent is executing
+    await sleep(50)
+    expect(calls.length).toBe(0)
+  })
+
+  test("root notifies idle once the nested family has finished", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(childCreated())
+    n.handleEvent(execStarted(CHILD_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // root hands off to the child
+    n.handleEvent(grandchildCreated())
+    n.handleEvent(execStarted(GRANDCHILD_ID))
+    n.handleEvent(execSucceeded(CHILD_ID)) // child hands off to the grandchild
+    n.handleEvent(execStarted(SESSION_ID)) // root resumes with the child's result
+    n.handleEvent(execSucceeded(SESSION_ID)) // grandchild still executing
+    await sleep(50)
+    expect(calls.length).toBe(0)
+    n.handleEvent(execSucceeded(GRANDCHILD_ID))
+    n.handleEvent(execStarted(CHILD_ID)) // child resumes with the grandchild's result
+    n.handleEvent(execSucceeded(CHILD_ID))
+    n.handleEvent(execStarted(SESSION_ID)) // root resumes with the child's result
+    n.handleEvent(execSucceeded(SESSION_ID)) // genuine idle — nothing is executing
+    await sleep(50)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.title).toBe("💤 Idle")
+  })
+
+  test("the idle debounce re-checks for nested sub-agents before firing", async () => {
+    const calls: SentCall[] = []
+    const n = makeNotifier((p) => calls.push(p))
+    n.handleEvent(sessionCreated())
+    n.handleEvent(execStarted(SESSION_ID))
+    n.handleEvent(execSucceeded(SESSION_ID)) // schedules the idle debounce
+    n.handleEvent(childCreated())
+    n.handleEvent(grandchildCreated())
+    n.handleEvent(execStarted(GRANDCHILD_ID)) // nested sub-agent starts inside the window
     await sleep(50)
     expect(calls.length).toBe(0)
   })

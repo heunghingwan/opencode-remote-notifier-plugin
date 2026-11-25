@@ -503,13 +503,16 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     return Boolean(sessions.get(sessionID)?.parentID)
   }
 
-  // True while any sub-agent child of this session is still executing. Used
-  // to suppress the parent's idle notification: when the parent hands off to
-  // a sub-agent, the parent's execution ends and an idle signal fires even
-  // though the family is still working.
-  function hasActiveChild(parentID: string): boolean {
+  // True while any sub-agent below this session in the tree — a direct
+  // child or a nested one — is still executing. Used to suppress the
+  // ancestor's idle notification: when a session hands off to a sub-agent,
+  // its execution ends and an idle signal fires even though the family is
+  // still working. Depth matters: a child that itself handed off to a
+  // nested sub-agent goes idle too, so matching direct children alone lets
+  // the root of a three-level family notify while a grandchild works.
+  function hasActiveDescendant(ancestorID: string): boolean {
     for (const id of active) {
-      if (sessions.get(id)?.parentID === parentID) return true
+      if (isDescendantOf(id, ancestorID)) return true
     }
     return false
   }
@@ -664,10 +667,10 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       return
     }
 
-    // Suppress the parent's idle while a sub-agent child is still working —
-    // this idle is the tool-call handoff, not genuine idleness. The parent
-    // re-busies when the child's result returns.
-    if (hasActiveChild(sessionID)) {
+    // Suppress the ancestor's idle while a sub-agent below it is still
+    // working — this idle is the tool-call handoff, not genuine idleness.
+    // The ancestor re-busies when the sub-agent's result returns.
+    if (hasActiveDescendant(sessionID)) {
       logger.debug("Parent idle while child active — suppressing", { sessionID })
       return
     }
@@ -690,7 +693,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       idleDebounce.delete(sessionID)
       // Re-check at fire time: a sub-agent may have started between the idle
       // signal and now (cross-session event ordering is not guaranteed).
-      if (hasActiveChild(sessionID)) {
+      if (hasActiveDescendant(sessionID)) {
         logger.debug("Idle debounce fired with child active — suppressing", { sessionID })
         return
       }
