@@ -231,6 +231,10 @@ describe("plugin setup wiring (RPC registration)", () => {
     )
     const prevHome = process.env.HOME
     process.env.HOME = home
+    // os.homedir() does not follow in-process HOME changes (Bun caches it),
+    // so pin the log path explicitly to keep this test off the real log.
+    const prevLog = process.env.REMOTE_NOTIFIER_LOG
+    process.env.REMOTE_NOTIFIER_LOG = path.join(home, "remote-notifier.log")
 
     // Intercept the transport: this wiring test must not hit the network.
     const fetches: Array<{ url: string; body: any }> = []
@@ -292,6 +296,8 @@ describe("plugin setup wiring (RPC registration)", () => {
     } finally {
       globalThis.fetch = realFetch
       process.env.HOME = prevHome
+      if (prevLog === undefined) delete process.env.REMOTE_NOTIFIER_LOG
+      else process.env.REMOTE_NOTIFIER_LOG = prevLog
       fs.rmSync(home, { recursive: true, force: true })
     }
   })

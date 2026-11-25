@@ -1318,7 +1318,11 @@ export async function subscribeWithRetry(opts: SubscribeRetryOptions): Promise<v
 export default Plugin.define({
   id: "remote-notifier",
   setup(ctx) {
-    const logger = createFileLogger()
+    // Default "info": per-event debug tracing writes ~10 KB/s on busy
+    // servers and would churn the 2 MiB rotation, burying the audit lines
+    // that matter (notifications, suppressions, errors). The file logger
+    // still records everything at info and above.
+    const logger = createFileLogger(undefined, { minLevel: "info" })
     const config = readConfig(logger)
     if (!config) {
       logger.warn("Config not found/invalid, plugin disabled")
