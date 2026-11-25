@@ -29,6 +29,7 @@ const config: Config = {
     question:   { enabled: true, priority: 4 },
     idle:       { enabled: true, priority: 3 },
   },
+  external: { enabled: true },
   rateLimit: { maxPerMinute: 100, dedupWindowSec: 0 },
 }
 
@@ -1369,6 +1370,11 @@ describe("plugin setup wiring", () => {
           await new Promise(() => {})
         },
       },
+      // The RPC registration surface (notify for other plugins) — a stub
+      // here; the wiring is covered by rpc.test.ts.
+      rpc: {
+        register: async () => ({ dispose: async () => {} }),
+      },
     }
 
     try {
@@ -1514,6 +1520,15 @@ describe("readConfig", () => {
   test("returns null when the config file is absent", () => {
     withHome({}, () => {
       expect(readConfig(silentLogger)).toBeNull()
+    })
+  })
+
+  test("merges the external section: default enabled, user can disable", () => {
+    withHome({ "remote-notifier.json": { server: "http://ntfy.example.com", topic: "t1" } }, () => {
+      expect(readConfig(silentLogger)!.external.enabled).toBe(true)
+    })
+    withHome({ "remote-notifier.json": { server: "http://ntfy.example.com", topic: "t1", external: { enabled: false } } }, () => {
+      expect(readConfig(silentLogger)!.external.enabled).toBe(false)
     })
   })
 })

@@ -9,6 +9,9 @@
     "question":   { "enabled": true, "priority": 4 },
     "idle":       { "enabled": true, "priority": 3 }
   },
+  "external": {
+    "enabled": true
+  },
   "rateLimit": {
     "maxPerMinute": 5,
     "dedupWindowSec": 30

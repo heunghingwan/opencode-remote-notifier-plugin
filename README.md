@@ -9,6 +9,7 @@ Built for **OpenCode V2** (v2.0.21+). The V1 plugin API is not supported.
 - **4 event types**: session errors, permission requests, questions, idle notifications
 - **Compact titles**: `emoji + conversation title` (e.g. `💤 Fix login bug`) — no long prefix, so the session name stays visible on the phone's notification bar
 - **Session titles**: automatically includes the conversation title (supports Unicode/Chinese); when the title event was missed (server restart, plugin reload), it is fetched from the session API before notifying
+- **RPC notify**: other plugins (e.g. opencode-error-handler-plugin) can push their own notifications through this plugin's ntfy pipeline — one transport, one rate limit
 - **Rate limiting**: configurable dedup window and max notifications per minute
 - **Retry**: auto-retries up to 3 times with exponential backoff
 - **Markdown**: notification bodies support Markdown formatting
@@ -39,6 +40,9 @@ Then create `~/.config/opencode/remote-notifier.json`:
     "question":   { "enabled": true, "priority": 4 },
     "idle":       { "enabled": true, "priority": 3 }
   },
+  "external": {
+    "enabled": true
+  },
   "rateLimit": {
     "maxPerMinute": 5,
     "dedupWindowSec": 30
@@ -62,6 +66,7 @@ opencode plugin list
 | `topic` | — | Your unique topic name (required) |
 | `token` | `""` | Bearer token for authenticated topics |
 | `markdown` | `true` | Enable Markdown in notification body |
+| `external` | `{"enabled": true}` | RPC `notify` calls from other plugins (see below) |
 
 ### Events
 
@@ -74,8 +79,40 @@ opencode plugin list
 
 ### Rate Limiting
 
-- **Dedup**: Same event type + same session within `dedupWindowSec` seconds → skipped
-- **Rate cap**: At most `maxPerMinute` notifications globally per minute → excess dropped
+- **Dedup**: Same event type + same session within `dedupWindowSec` seconds → skipped (external RPC notifications dedup on their title+message content instead)
+- **Rate cap**: At most `maxPerMinute` notifications globally per minute → excess dropped (shared budget across event notifications and external RPC notifications)
+
+### External RPC
+
+Other plugins can push their own notifications through this plugin's ntfy pipeline instead of building their own transport. The RPC is registered in every OpenCode server where this plugin runs:
+
+- **RPC id**: `remote-notifier`
+- **Method**: `notify`
+- **Input**: `{ title: string, message: string, priority?: number }`
+- **Output**: `{ sent: boolean }` — whether the notification entered the pipeline
+
+The input is JSON-Schema-validated (missing `title`/`message` fails with `rpc.invalid_input` before any handler runs). `title` and `message` are delivered verbatim — no emoji or project prefix is added. `priority` maps onto the existing ntfy priority system (1–5, clamped; defaults to the `error` event's priority when omitted). Notifications pushed this way obey the global rate limit above.
+
+Calling it from another plugin (loose, as the error-handler plugin does today):
+
+```ts
+await ctx.rpc({ id: "remote-notifier", methods: { notify: {} } }).notify({
+  title: "⚠️ Quota exhausted",
+  message: "anthropic resets at 12:00",
+  priority: 4,
+})
+```
+
+Or with the typed definition published as a subpath export:
+
+```ts
+import { NotifierRpc } from "opencode-remote-notifier-plugin/rpc"
+
+const notifier = ctx.rpc(NotifierRpc)
+const { sent } = await notifier.notify({ title: "…", message: "…" })
+```
+
+Set `external.enabled: false` to silence the RPC surface while keeping event notifications on.
 
 ## How It Works
 

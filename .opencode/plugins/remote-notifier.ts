@@ -2,6 +2,9 @@ import { Plugin } from "@opencode/plugin"
 import fs from "node:fs"
 import path from "node:path"
 
+import { NotifierRpc, asNotifyInput } from "./rpc.ts"
+import type { NotifyInput } from "./rpc.ts"
+
 // ---- Logger ----
 // V2 plugin context has no structured log endpoint; console output is
 // captured by the server log (filter role=server).
@@ -34,7 +37,12 @@ function createLogger(): Logger {
 
 // ---- Types ----
 
-export type EventType = "error" | "permission" | "question" | "idle"
+// "external" is not a session event: it is the RPC entry point other
+// plugins call (see rpc.ts), routed through the same dispatch pipeline.
+export type EventType = "error" | "permission" | "question" | "idle" | "external"
+
+/** Session-driven notification types — the four keys of config.events. */
+export type SessionEventType = Exclude<EventType, "external">
 
 interface EventConfig {
   enabled: boolean
@@ -46,7 +54,11 @@ export interface Config {
   topic: string
   token: string
   markdown: boolean
-  events: Record<EventType, EventConfig>
+  events: Record<SessionEventType, EventConfig>
+  /** RPC surface for other plugins (see rpc.ts). Enabled by default. */
+  external: {
+    enabled: boolean
+  }
   rateLimit: {
     maxPerMinute: number
     dedupWindowSec: number
@@ -63,6 +75,9 @@ const DEFAULTS: Config = {
     permission: { enabled: true, priority: 4 },
     question:   { enabled: true, priority: 4 },
     idle:       { enabled: true, priority: 3 },
+  },
+  external: {
+    enabled: true,
   },
   rateLimit: {
     maxPerMinute: 5,
@@ -98,6 +113,9 @@ export function readConfig(logger: Logger): Config | null {
         permission: { ...DEFAULTS.events.permission, ...user.events?.permission },
         question:   { ...DEFAULTS.events.question, ...user.events?.question },
         idle:       { ...DEFAULTS.events.idle, ...user.events?.idle },
+      },
+      external: {
+        enabled: user.external?.enabled ?? DEFAULTS.external.enabled,
       },
       rateLimit: {
         maxPerMinute: user.rateLimit?.maxPerMinute ?? DEFAULTS.rateLimit.maxPerMinute,
@@ -245,7 +263,8 @@ interface SessionInfo {
 // One emoji per event type is the whole title prefix — phone notification
 // bars truncate early, so "opencode"/type words are deliberately omitted.
 // ntfy tag emojis are not sent: the in-title emoji is the single icon.
-const EVENT_EMOJI: Record<EventType, string> = {
+// (external has no entry: RPC callers bring their own full title.)
+const EVENT_EMOJI: Record<SessionEventType, string> = {
   error:      "🚨",
   permission: "🔐",
   question:   "❓",
@@ -253,7 +272,7 @@ const EVENT_EMOJI: Record<EventType, string> = {
 }
 
 // Fallback label used only when the session's real title is unknown.
-const EVENT_LABELS: Record<EventType, string> = {
+const EVENT_LABELS: Record<SessionEventType, string> = {
   error:      "Error",
   permission: "Permission",
   question:   "Question",
@@ -312,10 +331,21 @@ function questionLines(form: any): { lines: string; options: string } {
 // worktree, when the location is a linked git worktree) and lastText (the
 // finished turn's last assistant text, tracked from session.text.ended).
 export function buildMessage(config: Config, type: EventType, payload: any, sessionTitle?: string | null): { title: string; message: string } {
+  const md = config.markdown
+
+  // External notifications arrive fully composed (RPC callers, see rpc.ts):
+  // pass the caller's title and message through verbatim — no emoji, no
+  // project prefix, no markdown wrapping.
+  if (type === "external") {
+    return {
+      title: typeof payload?.title === "string" ? payload.title : "",
+      message: typeof payload?.message === "string" ? payload.message : "",
+    }
+  }
+
   const emoji = EVENT_EMOJI[type]
   const effectiveTitle = sessionTitle && !isDefaultTitle(sessionTitle) ? sessionTitle : EVENT_LABELS[type]
   const title = `${emoji} ${effectiveTitle}`
-  const md = config.markdown
 
   switch (type) {
     case "error": {
@@ -366,6 +396,16 @@ export function buildMessage(config: Config, type: EventType, payload: any, sess
       }
     }
   }
+}
+
+// ---- External (RPC) priority mapping ----
+// ntfy accepts priorities 1-5 only. RPC callers may pass any number (the
+// contract says number): clamp into range, and fall back to the error
+// priority — the closest existing default for "something went wrong" —
+// when the caller omits it.
+function externalPriority(priority: unknown, fallback: number): number {
+  if (typeof priority !== "number" || !Number.isFinite(priority)) return fallback
+  return Math.min(5, Math.max(1, Math.round(priority)))
 }
 
 // ---- Project name resolution ----
@@ -605,14 +645,24 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     void ensureTitle(sessionID).then(() => dispatch(eventType, data, sessionID))
   }
 
+  // Sends one notification through the shared pipeline: the global rate
+  // limiter (per-minute cap + dedup), the message builder, and the ntfy
+  // transport with retries. Returns whether the notification was accepted
+  // (rate limiting may drop it); session-event callers ignore the value,
+  // the RPC surface reports it to its caller.
   function dispatch(
     eventType: EventType,
     data: any,
     sessionID: string | undefined,
-  ): void {
-    const dedupKey = `${eventType}:${sessionID ?? "unknown"}`
+  ): boolean {
+    // External notifications have no session to key the dedup on — key on
+    // the caller's content instead, so a repeat within the window is
+    // dropped while distinct messages still pass (subject to the cap).
+    const dedupKey = eventType === "external"
+      ? `external:${data?.title}:${data?.message}`
+      : `${eventType}:${sessionID ?? "unknown"}`
     // idle naturally dedups via the active set; other events use per-key dedup.
-    if (!limiter.allow(dedupKey, eventType === "idle")) return
+    if (!limiter.allow(dedupKey, eventType === "idle")) return false
 
     const sessionTitle = sessionID ? sessions.get(sessionID)?.title ?? null : null
     // Ownership gating guarantees the session's directory equals this
@@ -624,8 +674,11 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       ? { lastText: lastText.get(sessionID) }
       : {}
     const { title, message } = buildMessage(config, eventType, { ...data, project: { name: project }, ...extra }, sessionTitle)
+    const priority = eventType === "external"
+      ? externalPriority(data?.priority, config.events.error.priority)
+      : config.events[eventType].priority
 
-    logger.info("Sending notification", { type: eventType, title, priority: config.events[eventType].priority })
+    logger.info("Sending notification", { type: eventType, title, priority })
 
     void send({
       server: config.server,
@@ -634,11 +687,26 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
       markdown: config.markdown,
       title,
       message,
-      priority: config.events[eventType].priority,
+      priority,
       // The title already carries the single event emoji; ntfy tag emojis
       // would only duplicate it in the notification row.
       tags: [],
     })
+    return true
+  }
+
+  // ---- RPC entry point (see rpc.ts) ----
+  // Other plugins push fully-composed notifications through the exact same
+  // pipeline as session events: one global rate limiter (maxPerMinute plus
+  // content dedup), one transport, one retry policy. Returns whether the
+  // notification entered the pipeline (a false return means the external
+  // surface is disabled or rate limiting dropped it).
+  function notifyExternal(input: NotifyInput): boolean {
+    if (!config.external.enabled) {
+      logger.debug("External notify disabled — skipping")
+      return false
+    }
+    return dispatch("external", input, undefined)
   }
 
   // Shared idle-signal handling. Called from both session.status idle and
@@ -1154,7 +1222,7 @@ export function createNotifier(config: Config, logger: Logger, projectDir: strin
     errored.clear()
   }
 
-  return { handleEvent, cleanup, reset }
+  return { handleEvent, cleanup, reset, notifyExternal }
 }
 
 // ---- Subscription with reconnect ----
@@ -1240,6 +1308,7 @@ export default Plugin.define({
       enabledEvents: Object.entries(config.events)
         .filter(([, v]) => v.enabled)
         .map(([k]) => k),
+      externalRpc: config.external.enabled,
     })
 
     const notifier = createNotifier(config, logger, ctx.location.directory, {
@@ -1271,6 +1340,32 @@ export default Plugin.define({
     })
     const controller = new AbortController()
 
+    // ---- RPC surface (see rpc.ts): other plugins push notifications ----
+    // Registration is async while this setup stays sync (its cleanup
+    // contract is a plain function), so the registration promise settles
+    // on its own and unload disposes it. OpenCode V2 runs one instance per
+    // active location and each registers the same id — the RPC registry
+    // routes a call to the latest registration, and every instance reads
+    // the same global config, so whichever instance answers behaves
+    // identically.
+    const registration = ctx.rpc
+      .register(NotifierRpc, {
+        notify: async (input) => {
+          const parsed = asNotifyInput(input)
+          if (!parsed) {
+            // The RPC layer validates input against the schema before this
+            // handler runs; malformed input here means the call bypassed it.
+            logger.warn("RPC notify rejected malformed input")
+            return { sent: false }
+          }
+          return { sent: notifier.notifyExternal(parsed) }
+        },
+      })
+      .catch((err: any) => {
+        logger.error("RPC registration failed", { error: String(err) })
+        return null
+      })
+
     void subscribeWithRetry({
       subscribe: (signal) => ctx.event.subscribe({ signal }),
       onEvent: (event) => notifier.handleEvent(event),
@@ -1282,6 +1377,9 @@ export default Plugin.define({
     return () => {
       controller.abort()
       notifier.cleanup()
+      void registration.then((reg) => {
+        void reg?.dispose().catch(() => {})
+      })
       logger.info("Plugin unloaded")
     }
   },
